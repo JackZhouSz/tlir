@@ -143,7 +143,6 @@ def train_stage(scene: mi.Scene,
             img = mi.render(scene, params, sensor=sensors[sensor_idx], 
                           spp=config.spp, seed=it)
             loss = compute_loss(img, ref_images[sensor_idx], config.loss_type)
-            # loss += dr.mean(dr.abs(dr.grad(params['sigmat']))) * 100.0
 
             dr.backward(loss)
             total_loss += loss

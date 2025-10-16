@@ -73,7 +73,7 @@ class RadianceFieldPRB(mi.python.ad.integrators.common.RBIntegrator):
         t = mi.Float(mint) + sampler.next_1d(active) * step_size
         L = mi.Spectrum(0.0 if primal else state_in)
         δL = mi.Spectrum(δL if δL is not None else 0)
-        β = mi.Spectrum(1.0) # throughput
+        Tr = mi.Float(1.0)
                 
         while active:
             p = ray(t)
@@ -83,9 +83,9 @@ class RadianceFieldPRB(mi.python.ad.integrators.common.RBIntegrator):
                     sigmat = dr.maximum(sigmat, 0.0)
                 tr = dr.exp(-sigmat * step_size)
                 # Evaluate the directionally varying emission (weighted by transmittance)
-                Le = β * (1.0 - tr) * self.eval_emission(p, ray.d) 
+                Le = Tr * (1.0 - tr) * self.eval_emission(p, ray.d) 
 
-            β *= tr
+            Tr *= tr
             L = L + Le if primal else L - Le
 
             with dr.resume_grad(when=not primal):
@@ -93,7 +93,7 @@ class RadianceFieldPRB(mi.python.ad.integrators.common.RBIntegrator):
                     dr.backward_from(δL * (L * tr / dr.detach(tr) + Le))
 
             t += step_size
-            active &= (t < maxt) & dr.any(β != 0.0)
+            active &= (t < maxt) & dr.any(mi.Spectrum(Tr) != 0.0)
 
         return L if primal else δL, mi.Bool(True), [], L
 
@@ -192,8 +192,9 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
 
         # Accumulated transmittance gradient
         trans_grad_buffer = mi.Float(0.0)
-        w_acc = mi.Float(0.0)
 
+        # Reservoir sampling for DRT
+        w_acc = mi.Float(0.0)
         reservoir_t = mi.Float(0.0)
         reservoir_dt = mi.Float(0.0)
         
@@ -255,7 +256,6 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
                     # Transmittance gradient
                     trans_grad_buffer += sigmat
 
-            # L = L + Le if primal else L - Le
             L = Le
 
             with dr.resume_grad(when=not primal):
@@ -268,13 +268,10 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
                             (
                                 sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
                                 + Le
-                                # - trans_grad_buffer * dr.detach(L + Le) * interaction_mask
-                                - trans_grad_buffer * dr.detach(Le) * interaction_mask
+                                # - trans_grad_buffer * dr.detach(Le) * interaction_mask
                             )
                         )
 
-            if should_interact:
-                trans_grad_buffer = mi.Float(0.0)
 
             # Update transmittance
             Tr *= (1 - interaction_prob)
@@ -285,6 +282,32 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
             
             # Stop if throughput becomes too small
             active &= dr.any(mi.Spectrum(Tr) > self.min_throughput)
+
+        # Compute transmittance gradient
+        trans_grad_buffer = mi.Float(0.0)
+        interval = t - mint
+        n_samples = 1
+
+        # Transmittance gradient
+        for _ in range(n_samples):
+            new_t = sampler.next_1d(mi.Bool(True)) * interval + mint
+            new_p = ray(new_t)
+
+            with dr.resume_grad():
+                majorant = self.majorant_grid.eval(dr.clip(new_p, 0.0, 1.0))[0]
+
+                if self.use_relu:
+                    sigmat = dr.clip(self.sigmat.eval(dr.clip(new_p, 0.0, 1.0))[0], 0.0, majorant)
+                else:
+                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(new_p, 0.0, 1.0))[0], majorant)
+
+                trans_grad_buffer += sigmat
+
+        inv_pdf = interval / n_samples
+
+        with dr.resume_grad():
+            trans_grad_buffer = dr.select(active, trans_grad_buffer, 0.)
+            dr.backward_from(-trans_grad_buffer * dr.detach(inv_pdf * L))
 
         # DRT gradient update
         with dr.resume_grad(when=not primal):

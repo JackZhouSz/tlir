@@ -5,6 +5,7 @@ This module contains reusable functions for training loops, optimization,
 and parameter management for NeRF-like reconstruction pipelines.
 """
 
+from config import ExperimentConfig
 import drjit as dr
 import mitsuba as mi
 from typing import List, Dict, Any, Optional, Callable
@@ -133,7 +134,8 @@ def train_stage(scene: mi.Scene,
     losses = []
     final_images = []
     
-    print(f"Stage {stage_idx+1:02d}, feature voxel grids resolution -> {opt['sigmat'].shape[0]}")
+    if 'sigmat' in opt:
+        print(f"Stage {stage_idx+1:02d}, feature voxel grids resolution -> {opt['sigmat'].shape[0]}")
     
     for it in range(config.num_iterations_per_stage):
         total_loss = 0.0
@@ -195,6 +197,66 @@ def train_radiance_field(scene: mi.Scene,
 
     # Determine which parameters to optimize based on integrator type
     opt_params = {'sh_coeffs': params['sh_coeffs']}
+
+    if 'sigmat' in params:
+        # RadianceFieldPRB or RadianceFieldPRBRT (density only)
+        opt_params['sigmat'] = params['sigmat']
+
+    opt = create_optimizer(opt_params, config.learning_rate)
+    params.update(opt)
+    
+    all_losses = []
+    intermediate_images = []
+    
+    for stage in range(config.num_stages):
+        stage_losses, stage_images = train_stage(
+            scene, sensors, ref_images, params, opt, config, stage, progress_callback
+        )
+        
+        all_losses.extend(stage_losses)
+        intermediate_images.append(stage_images)
+        
+        # Upsample parameters if enabled and not the last stage
+        if config.enable_upsampling and stage < config.num_stages - 1:
+            upsample_parameters(opt)
+            params.update(opt)
+    
+    print('')
+    print('Done')
+    
+    return {
+        'losses': all_losses,
+        'intermediate_images': intermediate_images,
+        'final_params': params,
+        'optimizer': opt
+    }
+
+
+def train_prb_volpath(scene: mi.Scene,
+                        sensors: List[mi.Sensor],
+                        ref_images: List[mi.TensorXf],
+                        config: TrainingConfig,
+                        progress_callback: Optional[Callable] = None) -> Dict[str, Any]:
+    """
+    Complete training loop for radiance field reconstruction.
+
+    Args:
+        scene: Mitsuba scene
+        sensors: List of camera sensors
+        ref_images: List of reference images
+        config: Training configuration
+        progress_callback: Optional callback for progress updates
+
+    Returns:
+        Dictionary containing training results
+    """
+    # Get scene parameters and create optimizer
+    params = mi.traverse(scene)
+
+    # Determine which parameters to optimize based on integrator type
+    key_sigmat = 'object.interior_medium.sigma_t.data'
+    key_albedo = 'object.interior_medium.albedo.data'
+    opt_params = {key_sigmat: params[key_sigmat]}
 
     if 'sigmat' in params:
         # RadianceFieldPRB or RadianceFieldPRBRT (density only)
@@ -302,12 +364,74 @@ def create_scene(integrator_type: str = 'rf_prb') -> mi.Scene:
     Returns:
         Mitsuba scene
     """
-    return mi.load_dict({
-        'type': 'scene', 
-        'integrator': {
-            'type': integrator_type
-        }, 
-        'emitter': {
-            'type': 'constant'
+    if integrator_type == 'prb_volpath':
+        scene_dict = {
+            'type': 'scene',
+            'integrator': {'type': 'prbvolpath', 'hide_emitters': True},
+            'object': {
+                'type': 'cube',
+                'bsdf': {'type': 'null'},
+                'interior': {
+                    'type': 'heterogeneous',
+                    'sigma_t': {
+                        'type': 'gridvolume',
+                        'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (16, 16, 16, 1))),
+                        # 'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35).rotate([1, 0, 0], -90).scale(2).translate(-0.5)
+                    },
+                    # 'albedo': {
+                    #     'type': 'gridvolume',
+                    #     'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (16, 16, 16, 3))),
+                    #     # 'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35).rotate([1, 0, 0], -90).scale(2).translate(-0.5)
+                    # },
+                    # 'scale': 40
+                },
+                'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35),
+            },
+            'emitter': {'type': 'constant'}
         }
-    })
+        return mi.load_dict(scene_dict)
+    elif integrator_type in ['rf_prb', 'rf_prb_rt', 'rf_prb_drt', 'rf_eikonal']:
+        return mi.load_dict({
+            'type': 'scene', 
+            'integrator': {
+                'type': integrator_type
+            }, 
+            'emitter': {
+                'type': 'constant'
+            }
+        })
+    else:
+        raise ValueError(f"Unknown scene for integrator type: {integrator_type}")
+
+
+def create_scene_reference(config: ExperimentConfig) -> mi.Scene:
+    """
+    Create a reference scene for generating ground truth images.
+    
+    Args:
+        config: Training configuration
+    """
+    if config.scene_name == "lego":
+        return mi.load_file('./scenes/lego/scene.xml')
+    elif config.scene_name == "fog":
+        scene_dict = {
+            'type': 'scene',
+            'integrator': {'type': 'prbvolpath', 'hide_emitters': config.hide_emitters},
+            'object': {
+                'type': 'cube',
+                'bsdf': {'type': 'null'},
+                'interior': {
+                    'type': 'heterogeneous',
+                    'sigma_t': {
+                        'type': 'gridvolume',
+                        'filename': 'scenes/volume.vol',
+                        'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35).rotate([1, 0, 0], -90).scale(2).translate(-0.5)
+                    },
+                    'scale': 40
+                },
+                'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35),
+            },
+            'emitter': {'type': 'constant'}
+        }
+
+        return mi.load_dict(scene_dict)

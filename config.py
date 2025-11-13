@@ -21,6 +21,7 @@ class ExperimentConfig:
     experiment_name: str = "radiance_field_experiment"
     timestamp: str = ""
     output_dir: str = "./outputs"
+    scene_name : str = "lego"
     
     # Rendering parameters
     render_res: int = 256
@@ -28,6 +29,7 @@ class ExperimentConfig:
     fov: float = 45.0
     camera_center: List[float] = None
     camera_radius: float = 1.3
+    hide_emitters: bool = True
     
     # Training parameters
     num_stages: int = 4
@@ -458,6 +460,10 @@ def validate_config(config: ExperimentConfig) -> List[str]:
         List of validation issues (empty if valid)
     """
     issues = []
+
+    valid_scene_names = ['lego', 'fog']
+    if config.scene_name not in valid_scene_names:
+        issues.append(f"scene_name must be one of {valid_scene_names}")
     
     # Check basic parameter ranges
     if config.render_res <= 0:
@@ -482,7 +488,7 @@ def validate_config(config: ExperimentConfig) -> List[str]:
         issues.append("num_iterations_per_stage must be positive")
     
     # Check integrator type
-    valid_integrators = ['rf_prb', 'rf_prb_rt', 'rf_eikonal']
+    valid_integrators = ['prb_volpath', 'rf_prb', 'rf_prb_rt', 'rf_prb_drt', 'rf_eikonal']
     if config.integrator_type not in valid_integrators:
         issues.append(f"integrator_type must be one of {valid_integrators}")
     

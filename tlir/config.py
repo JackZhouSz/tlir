@@ -14,16 +14,58 @@ from datetime import datetime
 
 
 @dataclass
+class RenderConfig:
+    """Configuration for rendering and camera setup."""
+
+    # Camera parameters
+    camera_center: List[float] = None
+    camera_radius: float = 1.3
+    up_vector: List[float] = None  # Up direction for all cameras (default: [0, 1, 0] = Y-up)
+    hemisphere_normal: List[float] = None  # Normal for hemisphere sampling (defaults to up_vector)
+
+    # Image counts
+    num_train: int = 100
+    num_test: int = 100
+
+    # Rendering quality
+    render_res: int = 256
+    fov: float = 45.0
+    spp: int = 128  # Samples per pixel
+
+    # Test camera trajectory
+    test_min_elevation: float = 30.0
+    test_max_elevation: float = 30.0
+    test_num_loops: float = 1.0
+
+    # Random seed
+    seed: int = 42
+
+    def __post_init__(self):
+        """Initialize default values after object creation."""
+        if self.camera_center is None:
+            self.camera_center = [0.0, 0.0, 0.0]
+
+        if self.up_vector is None:
+            self.up_vector = [0.0, 1.0, 0.0]  # Default Y-up
+
+        if self.hemisphere_normal is None:
+            self.hemisphere_normal = self.up_vector.copy()
+
+
+@dataclass
 class ExperimentConfig:
     """Configuration class for radiance field experiments."""
-    
+
     # Experiment metadata
     experiment_name: str = "radiance_field_experiment"
     timestamp: str = ""
     output_dir: str = "./outputs"
     scene_name : str = "lego"
-    
-    # Rendering parameters
+
+    # Rendering configuration (subconfig)
+    render_config: RenderConfig = None
+
+    # Legacy rendering parameters (for backward compatibility)
     render_res: int = 256
     sensor_count: int = 7
     fov: float = 45.0
@@ -42,6 +84,16 @@ class ExperimentConfig:
     spp: int = 1
     loss_type: str = 'l2'
     enable_upsampling: bool = True
+    gt_noise_std: float = 0.0  # Standard deviation of Gaussian noise added to ground truth images (0.0 = no noise)
+    gt_noise_use_mask: bool = True  # If True, apply noise only to background (1 - mask); if False, apply uniformly
+
+    # Ray-based training parameters
+    use_ray_batching: bool = False  # If True, sample random rays instead of random images
+    rays_per_batch: int = 4096  # Number of rays per training batch (only used if use_ray_batching=True)
+
+    # Stochastic preconditioning parameters (alternative to multi-resolution training)
+    stochastic_preconditioning_starting_alpha: float = 0.0  # Starting scale of noise added to query points (0.0 = disabled)
+    stochastic_preconditioning_iterations: int = -1  # Number of iterations for preconditioning decay (-1 = disabled)
     
     # Integrator parameters
     integrator_type: str = 'rf_prb'
@@ -80,16 +132,25 @@ class ExperimentConfig:
         """Initialize default values after object creation."""
         if not self.timestamp:
             self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         if self.camera_center is None:
-            self.camera_center = [0.5, 0.5, 0.5]
-        
+            self.camera_center = [0.0, 0.0, 0.0]
+
         if self.bbox_min is None:
             self.bbox_min = [0.0, 0.0, 0.0]
-        
+
         if self.bbox_max is None:
             self.bbox_max = [1.0, 1.0, 1.0]
-        
+
+        # Initialize render_config if not provided (using legacy parameters)
+        if self.render_config is None:
+            self.render_config = RenderConfig(
+                camera_center=self.camera_center,
+                camera_radius=self.camera_radius,
+                render_res=self.render_res,
+                fov=self.fov
+            )
+
         # Create output directory
         self.output_dir = os.path.join(self.output_dir, f"{self.experiment_name}_{self.timestamp}")
         os.makedirs(self.output_dir, exist_ok=True)
@@ -183,7 +244,10 @@ class ExperimentConfig:
             'max_initial_density': self.max_initial_density,
             'spp': self.spp,
             'loss_type': self.loss_type,
-            'enable_upsampling': self.enable_upsampling
+            'enable_upsampling': self.enable_upsampling,
+            'gt_noise_std': self.gt_noise_std,
+            'stochastic_preconditioning_starting_alpha': self.stochastic_preconditioning_starting_alpha,
+            'stochastic_preconditioning_iterations': self.stochastic_preconditioning_iterations
         }
 
 

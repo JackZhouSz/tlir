@@ -1,8 +1,9 @@
 import drjit as dr
 import mitsuba as mi
+from .base import TLIRIntegrator
 
 
-class RadianceFieldPRB(mi.python.ad.integrators.common.RBIntegrator):
+class RadianceFieldPRB(TLIRIntegrator):
     """
     A differentiable integrator for emissive volumes using regular ray marching.
     
@@ -49,46 +50,86 @@ class RadianceFieldPRB(mi.python.ad.integrators.common.RBIntegrator):
                ray, δL, state_in, active, **kwargs):
         """
         Main ray marching implementation.
-        
+
         Returns the radiance along a single input ray using regular ray marching.
+
+        AOVs:
+            [0]: Expected ray depth (distance along ray)
         """
         primal = mode == dr.ADMode.Primal
-        
+
+        # Extract stochastic preconditioning alpha from kwargs
+        spn_alpha = kwargs.get('spn_alpha', 0.0)
+
+        # Extract AOV gradients if in backward mode
+        δaovs = kwargs.get('δaovs', None)
+        δdepth = mi.Float(δaovs[0] if δaovs is not None and len(δaovs) > 0 else 0.0)
+
         ray = mi.Ray3f(ray)
         hit, mint, maxt = self.bbox.ray_intersect(ray)
-        
+
         active = mi.Bool(active)
         active &= hit  # ignore rays that miss the bbox
         if not primal:  # if the gradient is zero, stop early
-            active &= dr.any(δL != 0)
+            active &= dr.any(δL != 0) | (δaovs is not None and dr.any(δdepth != 0))
 
         step_size = mi.Float(1.0 / self.grid_res)
         t = mi.Float(mint) + sampler.next_1d(active) * step_size
         L = mi.Spectrum(0.0 if primal else state_in)
         δL = mi.Spectrum(δL if δL is not None else 0)
         β = mi.Spectrum(1.0) # throughput
-                
+
+        # Depth accumulator (expected distance along ray)
+        depth = mi.Float(0.0)
+
         while active:
             p = ray(t)
+
+            # Apply stochastic preconditioning: add Gaussian noise to query point
+            if spn_alpha > 0.0:
+                noise = mi.Vector3f(
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0
+                )
+                # Scale noise by alpha and grid resolution (noise in world space)
+                noise_scale = spn_alpha / self.grid_res
+                p = p + noise * noise_scale
+
             with dr.resume_grad(when=not primal):
                 sigmat = self.sigmat.eval(p)[0]
                 if self.use_relu:
                     sigmat = dr.maximum(sigmat, 0.0)
                 tr = dr.exp(-sigmat * step_size)
                 # Evaluate the directionally varying emission (weighted by transmittance)
-                Le = β * (1.0 - tr) * self.eval_emission(p, ray.d) 
+                Le = β * (1.0 - tr) * self.eval_emission(p, ray.d)
+
+                # Accumulate expected depth
+                # Use mean throughput for depth weighting
+                β_mean = dr.mean(β)
+                depth_contrib = t * (1.0 - tr) * β_mean
+
+            if primal:
+                depth = depth + depth_contrib
+            else:
+                depth = depth - depth_contrib
 
             β *= tr
             L = L + Le if primal else L - Le
 
             with dr.resume_grad(when=not primal):
                 if not primal:
+                    # Propagate radiance gradients
                     dr.backward_from(δL * (L * tr / dr.detach(tr) + Le))
+
+                    # Propagate depth gradients if provided
+                    if δaovs is not None and len(δaovs) > 0:
+                        dr.backward_from(δdepth * depth_contrib)
 
             t += step_size
             active &= (t < maxt) & dr.any(β != 0.0)
 
-        return L if primal else δL, mi.Bool(True), [], L
+        return L if primal else δL, mi.Bool(True), [depth], L
 
     def traverse(self, cb):
         """Return differentiable parameters for optimization."""

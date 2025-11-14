@@ -30,4 +30,6 @@ scenes/
 resources/
 outputs/
 venv/
-AdjointNonlinearRayTracing/
+.cache/
+data/
+experiments/

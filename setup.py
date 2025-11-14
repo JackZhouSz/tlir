@@ -1,24 +1,21 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-
 from setuptools import setup, find_packages
 
 setup(
-    name="volprim",
-    version="1.0",
-    author="Sébastien Speierer",
-    packages=["volprim"],
-    description="A Mitsuba extension library for ray tracing volumetric primitives",
+    name="tlir",
+    version="0.1.0",
+    packages=find_packages(),
+    description="TLIR: Trainable Light and Image Rendering - A framework for differentiable volumetric rendering",
     python_requires=">=3.8",
     install_requires=[
-        'ipywidgets',
-        'matplotlib',
         'numpy',
-        'rich',
-        'plyfile',
-        'pytest'
+        'matplotlib',
+        # Note: mitsuba and drjit should be installed separately via conda
     ],
-    url='https://github.com/your-username/ray-tracing-volumetric-primitives',
+    extras_require={
+        'dev': [
+            'pytest',
+            'jupyter',
+            'ipywidgets',
+        ]
+    },
 )

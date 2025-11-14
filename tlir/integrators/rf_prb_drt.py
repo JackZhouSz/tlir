@@ -1,8 +1,9 @@
 import drjit as dr
 import mitsuba as mi
+from .base import TLIRIntegrator
 
 
-class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
+class RadianceFieldPRBDRT(TLIRIntegrator):
     """
     A differentiable integrator for emissive volumes using ratio tracking.
     
@@ -62,14 +63,18 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
                ray, δL, state_in, active, **kwargs):
         """
         Main ratio tracking implementation.
-        
+
         Returns the radiance along a single input ray using ratio tracking.
         """
+        mi.Log(mi.LogLevel.Info, "Using RadianceFieldPRBDRT integrator.")
         primal = mode == dr.ADMode.Primal
-        
+
+        # Extract stochastic preconditioning alpha from kwargs
+        spn_alpha = kwargs.get('spn_alpha', 0.0)
+
         ray = mi.Ray3f(ray)
         hit, mint, maxt = self.bbox.ray_intersect(ray)
-        
+
         active = mi.Bool(active)
         active &= hit  # ignore rays that miss the bbox
         if not primal:  # if the gradient is zero, stop early
@@ -85,6 +90,11 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
 
         # Accumulated transmittance gradient
         trans_grad_buffer = mi.Float(0.0)
+
+        # Reservoir sampling for DRT
+        w_acc = mi.Float(0.0)
+        reservoir_t = mi.Float(0.0)
+        reservoir_dt = mi.Float(0.0)
         
         while active:
             # Sample next interaction distance using majorant
@@ -93,48 +103,80 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
 
             # Get current majorant value at current position
             p = ray(t)
-            majorant = self.majorant_grid.eval(dr.clip(p, 0.0, 1.0))[0]
+
+            # Apply stochastic preconditioning to first query
+            p_query = p
+            if spn_alpha > 0.0:
+                noise = mi.Vector3f(
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0
+                )
+                noise_scale = spn_alpha / self.grid_res
+                p_query = p + noise * noise_scale
+
+            majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
 
             # Get steps size
             dt = dr.maximum(-dr.log(1.0 - u) / majorant, self.min_step_size)
             t += dt
             num_steps += 1
-            
+
             # Check if we've exited the volume
             active &= (t < maxt)
             active &= (num_steps < self.max_num_steps)
-                
+
             # Update ray position
             p = ray(t)
 
+            # Apply stochastic preconditioning to second query
+            p_query = p
+            if spn_alpha > 0.0:
+                noise = mi.Vector3f(
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0,
+                    sampler.next_1d(active) * 2.0 - 1.0
+                )
+                noise_scale = spn_alpha / self.grid_res
+                p_query = p + noise * noise_scale
+
+            # Reservoir sampling for DRT
+            w_step = Tr * dt
+            w_acc += w_step
+
+            should_update_reservoir = (sampler.next_1d(active) * w_acc) < w_step
+
+            if should_update_reservoir:
+                reservoir_t = t
+                reservoir_dt = dt
+
             with dr.resume_grad(when=not primal):
                 # Get actual extinction coefficient at this point
-                majorant = self.majorant_grid.eval(dr.clip(p, 0.0, 1.0))[0]
+                majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
 
                 if self.use_relu:
-                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p, 0.0, 1.0))[0], 0.0, majorant)
+                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], 0.0, majorant)
                 else:
-                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p, 0.0, 1.0))[0], majorant)
+                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], majorant)
 
                 if self.stopgrad_density:
                     sigmat = dr.detach(sigmat)
-                
+
                 # Ratio tracking: probability of interaction = σ / σ_majorant
                 interaction_prob = sigmat / majorant
-                
+
                 # Only emit when should_interact is true
                 should_interact = sampler.next_1d(active) < interaction_prob
                 interaction_mask = dr.select(should_interact, 1.0, 0.0)
 
                 if should_interact:
-                    Le = self.eval_emission(p, ray.d)
+                    Le = self.eval_emission(p_query, ray.d)
                 else:
                     Le = mi.Spectrum(0.0)
 
                     # Transmittance gradient
                     trans_grad_buffer += sigmat
 
-            # L = L + Le if primal else L - Le
             L = Le
 
             with dr.resume_grad(when=not primal):
@@ -145,15 +187,12 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
                         dr.backward_from(
                             δL * 
                             (
-                                sigmat * dr.detach(Le / sigmat)
+                                sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
                                 + Le
-                                # - trans_grad_buffer * dr.detach(L + Le) * interaction_mask
-                                - trans_grad_buffer * dr.detach(Le) * interaction_mask
+                                # - trans_grad_buffer * dr.detach(Le) * interaction_mask
                             )
                         )
 
-            if should_interact:
-                trans_grad_buffer = mi.Float(0.0)
 
             # Update transmittance
             Tr *= (1 - interaction_prob)
@@ -164,6 +203,78 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
             
             # Stop if throughput becomes too small
             active &= dr.any(mi.Spectrum(Tr) > self.min_throughput)
+
+        # Compute transmittance gradient
+        trans_grad_buffer = mi.Float(0.0)
+        interval = t - mint
+        n_samples = 1
+
+        # Transmittance gradient
+        for _ in range(n_samples):
+            new_t = sampler.next_1d(mi.Bool(True)) * interval + mint
+            new_p = ray(new_t)
+
+            # Apply stochastic preconditioning to transmittance gradient query
+            new_p_query = new_p
+            if spn_alpha > 0.0:
+                noise = mi.Vector3f(
+                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
+                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
+                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0
+                )
+                noise_scale = spn_alpha / self.grid_res
+                new_p_query = new_p + noise * noise_scale
+
+            with dr.resume_grad():
+                majorant = self.majorant_grid.eval(dr.clip(new_p_query, 0.0, 1.0))[0]
+
+                if self.use_relu:
+                    sigmat = dr.clip(self.sigmat.eval(dr.clip(new_p_query, 0.0, 1.0))[0], 0.0, majorant)
+                else:
+                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(new_p_query, 0.0, 1.0))[0], majorant)
+
+                trans_grad_buffer += sigmat
+
+        inv_pdf = interval / n_samples
+
+        with dr.resume_grad():
+            trans_grad_buffer = dr.select(active, trans_grad_buffer, 0.)
+            dr.backward_from(-trans_grad_buffer * dr.detach(inv_pdf * L))
+
+        # DRT gradient update
+        with dr.resume_grad(when=not primal):
+            if not self.stopgrad_density and not primal:
+                t, dt = reservoir_t, reservoir_dt
+                u = dr.clip(sampler.next_1d(mi.Bool(True)), 1e-6, 1.0 - 1e-6)
+                t += u * dt
+
+                p = ray(t)
+
+                # Apply stochastic preconditioning to DRT gradient update query
+                p_query = p
+                if spn_alpha > 0.0:
+                    noise = mi.Vector3f(
+                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
+                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
+                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0
+                    )
+                    noise_scale = spn_alpha / self.grid_res
+                    p_query = p + noise * noise_scale
+
+                Le = self.eval_emission(p_query, ray.d)
+
+                majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+
+                if self.use_relu:
+                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], 0.0, majorant)
+                else:
+                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], majorant)
+
+                dr.backward_from(
+                    δL * (
+                        sigmat * dr.detach(w_acc * Le / (sigmat * sigmat + 1.0))
+                    )
+                )
 
         return L if primal else δL, mi.Bool(True), [], L
 
@@ -181,4 +292,4 @@ class RadianceFieldPRBRT(mi.python.ad.integrators.common.RBIntegrator):
         self.grid_res = self.sigmat.shape[0]
         self.min_step_size = dr.max(self.bbox.extents()) / self.sigmat.shape[0] * 1e-2
 
-mi.register_integrator("rf_prb_rt", lambda props: RadianceFieldPRBRT(props))
+mi.register_integrator("rf_prb_drt", lambda props: RadianceFieldPRBDRT(props))

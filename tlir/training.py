@@ -28,12 +28,13 @@ class TrainingConfig:
                  spp: int = 1,
                  loss_type: str = 'l1',
                  enable_upsampling: bool = True,
-                 gt_noise_std: float = 0.0,
-                 gt_noise_use_mask: bool = True,
                  use_ray_batching: bool = False,
                  rays_per_batch: int = 4096,
+                 num_test_images: int = 1,
                  stochastic_preconditioning_starting_alpha: float = 0.0,
-                 stochastic_preconditioning_iterations: int = -1):
+                 stochastic_preconditioning_iterations: int = -1,
+                 opacity_loss_weight: float = 0.0,
+                 empty_space_loss_weight: float = 0.0):
         """
         Initialize training configuration.
 
@@ -48,12 +49,13 @@ class TrainingConfig:
             spp: Samples per pixel for rendering
             loss_type: Type of loss function ('l1' or 'l2')
             enable_upsampling: Whether to enable grid upsampling
-            gt_noise_std: Standard deviation of Gaussian noise added to GT images (0.0 = no noise)
-            gt_noise_use_mask: If True, apply noise only to background regions; if False, apply uniformly
             use_ray_batching: If True, sample random rays instead of random images
             rays_per_batch: Number of rays per training batch (only used if use_ray_batching=True)
+            num_test_images: Number of test images to render at end of each stage for PSNR evaluation
             stochastic_preconditioning_starting_alpha: Starting scale of noise for query points
             stochastic_preconditioning_iterations: Number of iterations for preconditioning decay
+            opacity_loss_weight: Weight for opacity loss (throughput=1 where object_mask=1)
+            empty_space_loss_weight: Weight for empty space loss (throughput=0 where object_mask=0)
         """
         self.num_stages = num_stages
         self.num_iterations_per_stage = num_iterations_per_stage
@@ -65,12 +67,13 @@ class TrainingConfig:
         self.spp = spp
         self.loss_type = loss_type
         self.enable_upsampling = enable_upsampling
-        self.gt_noise_std = gt_noise_std
-        self.gt_noise_use_mask = gt_noise_use_mask
         self.use_ray_batching = use_ray_batching
         self.rays_per_batch = rays_per_batch
+        self.num_test_images = num_test_images
         self.stochastic_preconditioning_starting_alpha = stochastic_preconditioning_starting_alpha
         self.stochastic_preconditioning_iterations = stochastic_preconditioning_iterations
+        self.opacity_loss_weight = opacity_loss_weight
+        self.empty_space_loss_weight = empty_space_loss_weight
 
 
 def create_optimizer(params: Dict[str, Any], learning_rate: float) -> mi.ad.Adam:
@@ -85,101 +88,6 @@ def create_optimizer(params: Dict[str, Any], learning_rate: float) -> mi.ad.Adam
         Adam optimizer instance
     """
     return mi.ad.Adam(lr=learning_rate, params=params)
-
-
-def compute_loss(predicted: mi.TensorXf, target: mi.TensorXf, loss_type: str = 'l1') -> mi.Float:
-    """
-    Compute loss between predicted and target images.
-
-    Args:
-        predicted: Predicted image tensor
-        target: Target image tensor
-        loss_type: Type of loss ('l1' or 'l2')
-
-    Returns:
-        Loss value
-    """
-    if loss_type == 'l1':
-        return dr.mean(dr.abs(predicted - target), axis=None)
-    elif loss_type == 'l2':
-        return dr.mean(dr.square(predicted - target), axis=None)
-    else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
-
-
-def render_object_mask(scene: mi.Scene, sensor: mi.Sensor, spp: int) -> mi.TensorXf:
-    """
-    Render an object mask indicating where objects are present in the scene.
-
-    The mask is 1 where objects are present, 0 where background is present,
-    and intermediate values for semi-transparent regions.
-
-    Args:
-        scene: Mitsuba scene
-        sensor: Camera sensor
-        spp: Samples per pixel for mask rendering (same as image rendering)
-
-    Returns:
-        Mask tensor with values in [0, 1], shape matching rendered image
-    """
-    # Render image to get opacity/alpha information
-    # For volumetric scenes, we want to know where density is present
-    img = mi.render(scene, sensor=sensor, spp=spp)
-
-    # Compute mask based on image intensity
-    # Areas with objects will have non-zero RGB values
-    # Background will be zero (or very close to zero depending on scene)
-    mask = dr.mean(img, axis=-1, keepdims=True)  # Average RGB channels
-
-    # Expand to match image dimensions (broadcast across channels)
-    if len(img.shape) > len(mask.shape):
-        mask = dr.repeat(mask, img.shape[-1], axis=-1)
-
-    # Clamp to [0, 1]
-    mask = dr.clamp(mask, 0.0, 1.0)
-
-    return mask
-
-
-def add_gaussian_noise(
-    image: mi.TensorXf,
-    std: float,
-    seed: int,
-    mask: Optional[mi.TensorXf] = None
-) -> mi.TensorXf:
-    """
-    Add Gaussian noise to an image tensor, optionally masked to background regions.
-
-    Args:
-        image: Input image tensor
-        std: Standard deviation of Gaussian noise
-        seed: Random seed for reproducibility
-        mask: Optional object mask. If provided, noise is multiplied by (1 - mask)
-              so that object regions (mask=1) receive no noise and background
-              regions (mask=0) receive full noise.
-
-    Returns:
-        Noisy image tensor
-    """
-    if std <= 0.0:
-        return image
-
-    # Use DrJit's random number generator with a seed
-    rng = dr.PCG32(initstate=seed)
-
-    # Generate Gaussian noise with the same shape as the image
-    noise = dr.normal(mi.TensorXf, shape=image.shape, rng=rng) * std
-
-    # Apply mask if provided: noise * (1 - mask)
-    # mask=1 (object) -> noise * 0 = no noise on objects
-    # mask=0 (background) -> noise * 1 = full noise on background
-    if mask is not None:
-        noise = noise * (1.0 - mask)
-
-    # Add noise and clamp to valid range [0, 1] for image values
-    noisy_image = dr.clamp(image + noise, 0.0, 1.0)
-
-    return noisy_image
 
 
 def upsample_parameters(opt: mi.ad.Adam, factor: int = 2) -> None:
@@ -291,14 +199,11 @@ def sample_rays_from_image(
 def train_stage(scene: mi.Scene,
                 sensors: List[mi.Sensor],
                 ref_images: List[mi.TensorXf],
-                params: Dict[str, Any],
-                opt: mi.ad.Adam,
                 config: TrainingConfig,
                 stage_idx: int,
-                spn_state: Dict[str, Any],
                 progress_callback: Optional[Callable] = None,
                 ref_masks: Optional[List[mi.TensorXf]] = None,
-                ray_batch: Optional['RayBatch'] = None) -> tuple[List[float], List[mi.TensorXf]]:
+                ray_batch: Optional['RayBatch'] = None) -> tuple[List[float], List[mi.TensorXf], List[float]]:
     """
     Train for one stage of the optimization.
 
@@ -306,32 +211,32 @@ def train_stage(scene: mi.Scene,
     - Image-based: Samples all rays from one random image per iteration
     - Ray-based: Samples random rays from all images per iteration
 
-    The ONLY difference between modes is the ray sampling strategy.
-    Everything else (rendering, loss, optimization) is identical.
-
     Args:
         scene: Mitsuba scene
         sensors: List of camera sensors
         ref_images: List of reference images
-        params: Scene parameters
-        opt: Optimizer
         config: Training configuration
         stage_idx: Current stage index
-        spn_state: Stochastic preconditioning state (alpha, gamma, step)
         progress_callback: Optional callback for progress updates
         ref_masks: Optional list of object masks (for image-based training)
         ray_batch: Optional RayBatch (for ray-based training)
 
     Returns:
-        Tuple of (losses, final_images)
+        Tuple of (losses, test_images, test_psnrs)
     """
     import numpy as np
+    from tlir.metrics import compute_psnr
 
     losses = []
-    final_images = []
+    test_images = []
+    test_psnrs = []
 
-    if 'sigmat' in opt:
-        print(f"Stage {stage_idx+1:02d}, feature voxel grids resolution -> {opt['sigmat'].shape[0]}")
+    # Get integrator and configure
+    integrator = scene.integrator()
+    integrator.loss_type = config.loss_type
+
+    if 'sigmat' in integrator.optimizer:
+        print(f"Stage {stage_idx+1:02d}, feature voxel grids resolution -> {integrator.optimizer['sigmat'].shape[0]}")
 
     # Setup RNG
     rng = np.random.default_rng(seed=stage_idx * 1000)
@@ -340,16 +245,6 @@ def train_stage(scene: mi.Scene,
     shuffled_rays = None
     if config.use_ray_batching:
         shuffled_rays = ray_batch.shuffle(rng)
-
-    # Create loss function based on config (once, outside loop)
-    if config.loss_type == 'l1':
-        def loss_fn(rendered, target):
-            return dr.mean(dr.abs(rendered - target), axis=None)
-    elif config.loss_type == 'l2':
-        def loss_fn(rendered, target):
-            return dr.mean(dr.square(rendered - target), axis=None)
-    else:
-        raise ValueError(f"Unknown loss type: {config.loss_type}")
 
     for it in range(config.num_iterations_per_stage):
         # ========== RAY SAMPLING (ONLY DIFFERENCE BETWEEN MODES) ==========
@@ -369,52 +264,35 @@ def train_stage(scene: mi.Scene,
             )
 
         # ========== COMMON RENDERING AND TRAINING (SAME FOR BOTH MODES) ==========
-        spn_alpha = spn_state['alpha']
+        # Get current spn_alpha from integrator
+        spn_alpha = integrator.get_spn_alpha()
+
+        # Set masks for AOV loss (if available)
+        if masks_mi is not None:
+            integrator.set_aov_loss_config(masks=dr.ravel(masks_mi))
 
         # Render rays using integrator
-        integrator = scene.integrator()
         sampler = mi.load_dict({'type': 'independent'})
         sampler.seed(it, num_rays)
 
-        # Apply noise to target colors if configured
-        if config.gt_noise_std > 0.0:
-            noise_seed = stage_idx * 10000 + it * 100
-            target_colors = add_gaussian_noise(target_colors, config.gt_noise_std, noise_seed, masks_mi)
-
-        # Render with automatic gradient computation using TLIRIntegrator methods
-        # This handles the two-pass rendering (forward + backward) internally
+        # Render with automatic gradient computation using integrator loss methods
+        # Loss functions are defined as methods on the integrator class
         # Gradients are accumulated automatically - DO NOT call dr.backward(loss)
-        # Multi-spp is handled internally in render_rays_with_gradient
         rendered_colors, loss, aovs = integrator.render_rays_with_gradient(
             rays=rays_mi,
             target_colors=target_colors,
             sampler=sampler,
             scene=scene,
-            loss_fn=loss_fn,
             spp=config.spp,
             spn_alpha=spn_alpha
         )
 
         # Store loss value
         losses.append(loss.array[0])
-        # Note: aovs available for future use (e.g., auxiliary tasks)
 
-        # Optimizer step
-        opt.step()
-
-        # Update stochastic preconditioning alpha
-        if spn_state['step'] < config.stochastic_preconditioning_iterations:
-            spn_state['alpha'] *= spn_state['gamma']
-            spn_state['step'] += 1
-        else:
-            spn_state['alpha'] = 0.0
-
-        # Apply constraints if not using ReLU
-        if not config.use_relu:
-            if 'sigmat' in opt:
-                opt['sigmat'] = dr.maximum(opt['sigmat'], 0.0)
-
-        params.update(opt)
+        # Optimizer step and post-step updates
+        integrator.step_optimizer()
+        integrator.post_step_update(config)
 
         # Progress reporting
         if progress_callback:
@@ -425,39 +303,49 @@ def train_stage(scene: mi.Scene,
             else:
                 print(f"  --> iteration {it+1:02d}: error={losses[-1]:.6f}, spn_alpha={spn_alpha:.6f}, rays={num_rays}", end='\r')
 
-    # Note: No intermediate images saved in unified approach
-    # Both modes now work the same way (ray sampling)
-    return losses, final_images
+    # Render test images and compute PSNR at end of stage
+    if config.num_test_images > 0:
+        print()  # New line after training iterations
+        num_test_to_render = min(config.num_test_images, len(sensors))
+
+        # Select random test images
+        test_indices = rng.choice(len(sensors), size=num_test_to_render, replace=False)
+
+        for i, test_idx in enumerate(test_indices):
+            test_sensor = sensors[test_idx]
+            test_ref = ref_images[test_idx]
+
+            # Render test image with current scene state
+            rendered_img = mi.render(scene, sensor=test_sensor, spp=config.spp)
+
+            # Compute PSNR
+            psnr = compute_psnr(rendered_img, test_ref)
+
+            test_images.append(rendered_img)
+            test_psnrs.append(psnr)
+
+            print(f"  Test image {i+1}/{num_test_to_render} (sensor {test_idx}): PSNR = {psnr:.2f} dB")
+
+    return losses, test_images, test_psnrs
 
 
 def setup_training(
     scene: mi.Scene,
     config: TrainingConfig
-) -> tuple[Dict[str, Any], mi.ad.Adam]:
+) -> None:
     """
-    Common setup for training: initialize parameters and optimizer.
+    Common setup for training: initialize integrator optimizer and SPN.
 
     Args:
         scene: Mitsuba scene
         config: Training configuration
-
-    Returns:
-        Tuple of (params, optimizer)
     """
-    # Get scene parameters and create optimizer
-    params = mi.traverse(scene.integrator())
-
-    # Determine which parameters to optimize based on integrator type
-    opt_params = {'sh_coeffs': params['sh_coeffs']}
-
-    if 'sigmat' in params:
-        # RadianceFieldPRB or RadianceFieldPRBRT (density only)
-        opt_params['sigmat'] = params['sigmat']
-
-    opt = create_optimizer(opt_params, config.learning_rate)
-    params.update(opt)
-
-    return params, opt
+    integrator = scene.integrator()
+    integrator.initialize_optimizer(learning_rate=config.learning_rate)
+    integrator.setup_stochastic_preconditioning(
+        starting_alpha=config.stochastic_preconditioning_starting_alpha,
+        num_iterations=config.stochastic_preconditioning_iterations
+    )
 
 
 def setup_stochastic_preconditioning(config: TrainingConfig) -> Dict[str, Any]:
@@ -534,119 +422,60 @@ def train_radiance_field(scene: mi.Scene,
         progress_callback: Optional callback for progress updates
 
     Returns:
-        Dictionary containing training results
+        Dictionary containing training results including losses, test images, and test PSNRs
     """
-    # Dispatch to ray-based training if enabled
+    # Setup training
+    setup_training(scene, config)
+
+    # Setup for ray-based or image-based training
+    ray_batch = None
+    ref_masks_mi = None
+
     if config.use_ray_batching:
-        return train_radiance_field_ray_batching(
-            scene, sensors, ref_images, config, ref_masks, progress_callback
-        )
+        # Ray-based training: extract all rays upfront
+        from ray_batch import RayBatch, extract_rays_from_sensors
 
-    # Setup training
-    params, opt = setup_training(scene, config)
+        print("=" * 70)
+        print("Ray-based training mode")
+        print("=" * 70)
 
-    # Convert masks to Mitsuba tensors if provided
-    ref_masks_mi = convert_masks_to_mitsuba(ref_masks)
-
-    # Initialize stochastic preconditioning
-    spn_state = setup_stochastic_preconditioning(config)
-
-    all_losses = []
-    intermediate_images = []
-
-    for stage in range(config.num_stages):
-        stage_losses, stage_images = train_stage(
-            scene, sensors, ref_images, params, opt, config, stage, spn_state, progress_callback, ref_masks_mi
-        )
-        
-        all_losses.extend(stage_losses)
-        intermediate_images.append(stage_images)
-        
-        # Upsample parameters if enabled and not the last stage
-        if config.enable_upsampling and stage < config.num_stages - 1:
-            upsample_parameters(opt)
-            params.update(opt)
-    
-    print('')
-    print('Done')
-    
-    return {
-        'losses': all_losses,
-        'intermediate_images': intermediate_images,
-        'final_params': params,
-        'optimizer': opt
-    }
-
-
-def train_radiance_field_ray_batching(
-    scene: mi.Scene,
-    sensors: List[mi.Sensor],
-    ref_images: List[mi.TensorXf],
-    config: TrainingConfig,
-    ref_masks: Optional[List[np.ndarray]] = None,
-    progress_callback: Optional[Callable] = None
-) -> Dict[str, Any]:
-    """
-    Complete training loop using ray batching (sampling random rays instead of images).
-
-    This training mode is more efficient and can lead to better convergence,
-    especially for scenes with many training views.
-
-    Args:
-        scene: Mitsuba scene (trainable)
-        sensors: List of camera sensors
-        ref_images: List of reference images
-        config: Training configuration
-        ref_masks: Optional list of object masks (loaded from dataset, not rendered during training)
-        progress_callback: Optional callback for progress updates
-
-    Returns:
-        Dictionary containing training results
-    """
-    from ray_batch import RayBatch, extract_rays_from_sensors
-
-    print("=" * 70)
-    print("Ray-based training mode")
-    print("=" * 70)
-
-    # Setup training
-    params, opt = setup_training(scene, config)
-
-    # Extract all rays from training set
-    print(f"\nExtracting rays from {len(sensors)} training images...")
-    ray_batch = extract_rays_from_sensors(sensors, ref_images, ref_masks)
-    print(f"✓ Extracted {len(ray_batch)} total rays")
-    print(f"✓ Ray batch size per iteration: {config.rays_per_batch}")
-    print(f"✓ Total iterations per stage: {config.num_iterations_per_stage}")
-    print()
-
-    # Initialize stochastic preconditioning
-    spn_state = setup_stochastic_preconditioning(config)
+        print(f"\nExtracting rays from {len(sensors)} training images...")
+        ray_batch = extract_rays_from_sensors(sensors, ref_images, ref_masks)
+        print(f"✓ Extracted {len(ray_batch)} total rays")
+        print(f"✓ Ray batch size per iteration: {config.rays_per_batch}")
+        print(f"✓ Total iterations per stage: {config.num_iterations_per_stage}")
+        print()
+    else:
+        # Image-based training: convert masks to Mitsuba tensors if provided
+        ref_masks_mi = convert_masks_to_mitsuba(ref_masks)
 
     all_losses = []
+    all_test_images = []
+    all_test_psnrs = []
+
+    integrator = scene.integrator()
 
     for stage in range(config.num_stages):
-        # Use unified train_stage with ray_batch parameter
-        stage_losses, _ = train_stage(
-            scene, sensors, ref_images, params, opt, config, stage, spn_state,
-            progress_callback, ref_masks=None, ray_batch=ray_batch
+        stage_losses, test_images, test_psnrs = train_stage(
+            scene, sensors, ref_images, config, stage,
+            progress_callback, ref_masks_mi, ray_batch
         )
 
         all_losses.extend(stage_losses)
+        all_test_images.append(test_images)
+        all_test_psnrs.append(test_psnrs)
 
         # Upsample parameters if enabled and not the last stage
         if config.enable_upsampling and stage < config.num_stages - 1:
-            upsample_parameters(opt)
-            params.update(opt)
+            integrator.upsample_parameters()
 
     print('')
     print('Done')
 
     return {
         'losses': all_losses,
-        'intermediate_images': [],  # No intermediate images in ray mode
-        'final_params': params,
-        'optimizer': opt
+        'test_images': all_test_images,
+        'test_psnrs': all_test_psnrs
     }
 
 
@@ -699,27 +528,30 @@ def train_prb_volpath(scene: mi.Scene,
         spn_state['alpha'] = 0.0
 
     all_losses = []
-    intermediate_images = []
+    all_test_images = []
+    all_test_psnrs = []
 
     for stage in range(config.num_stages):
-        stage_losses, stage_images = train_stage(
+        stage_losses, test_images, test_psnrs = train_stage(
             scene, sensors, ref_images, params, opt, config, stage, spn_state, progress_callback
         )
-        
+
         all_losses.extend(stage_losses)
-        intermediate_images.append(stage_images)
-        
+        all_test_images.append(test_images)
+        all_test_psnrs.append(test_psnrs)
+
         # Upsample parameters if enabled and not the last stage
         if config.enable_upsampling and stage < config.num_stages - 1:
             upsample_parameters(opt)
             params.update(opt)
-    
+
     print('')
     print('Done')
-    
+
     return {
         'losses': all_losses,
-        'intermediate_images': intermediate_images,
+        'test_images': all_test_images,
+        'test_psnrs': all_test_psnrs,
         'final_params': params,
         'optimizer': opt
     }

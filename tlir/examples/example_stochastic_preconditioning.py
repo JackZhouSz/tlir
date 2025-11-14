@@ -111,7 +111,6 @@ train_config = training.TrainingConfig(
     spp=config_moderate_spn.spp,
     loss_type=config_moderate_spn.loss_type,
     enable_upsampling=config_moderate_spn.enable_upsampling,
-    gt_noise_std=config_moderate_spn.gt_noise_std,
     stochastic_preconditioning_starting_alpha=config_moderate_spn.stochastic_preconditioning_starting_alpha,
     stochastic_preconditioning_iterations=config_moderate_spn.stochastic_preconditioning_iterations
 )

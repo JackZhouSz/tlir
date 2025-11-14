@@ -84,8 +84,6 @@ class ExperimentConfig:
     spp: int = 1
     loss_type: str = 'l2'
     enable_upsampling: bool = True
-    gt_noise_std: float = 0.0  # Standard deviation of Gaussian noise added to ground truth images (0.0 = no noise)
-    gt_noise_use_mask: bool = True  # If True, apply noise only to background (1 - mask); if False, apply uniformly
 
     # Ray-based training parameters
     use_ray_batching: bool = False  # If True, sample random rays instead of random images
@@ -245,7 +243,6 @@ class ExperimentConfig:
             'spp': self.spp,
             'loss_type': self.loss_type,
             'enable_upsampling': self.enable_upsampling,
-            'gt_noise_std': self.gt_noise_std,
             'stochastic_preconditioning_starting_alpha': self.stochastic_preconditioning_starting_alpha,
             'stochastic_preconditioning_iterations': self.stochastic_preconditioning_iterations
         }

@@ -1,0 +1,702 @@
+diff --git a/tlir/integrators/base.py b/tlir/integrators/base.py
+index 21bbe06..1fa0d73 100644
+--- a/tlir/integrators/base.py
++++ b/tlir/integrators/base.py
+@@ -23,6 +23,360 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
+     from RBIntegrator.
+     """
+ 
++    def __init__(self, props):
++        """
++        Initialize the TLIR integrator.
++
++        Args:
++            props: Mitsuba properties
++        """
++        super().__init__(props)
++        # AOV loss functions: dict mapping loss names to (loss_fn, weight) tuples
++        # Each loss function receives the entire aovs_dict and returns a scalar loss
++        # Can be overridden by subclasses or set externally before training
++        self.aov_loss_fns = None
++
++    def set_default_aov_losses(self, masks=None, opacity_weight=1.0, empty_space_weight=1.0):
++        """
++        Set up default AOV loss functions (opacity + empty space).
++
++        This provides a convenient default that can be called during training setup.
++        Subclasses can override this method to provide different defaults.
++
++        Args:
++            masks: Binary mask indicating where objects exist (required)
++            opacity_weight: Weight for opacity loss (default: 1.0)
++            empty_space_weight: Weight for empty space loss (default: 1.0)
++        """
++        if masks is None:
++            self.aov_loss_fns = None
++            return
++
++        from ..loss_utils import create_opacity_loss, create_empty_space_loss
++
++        self.aov_loss_fns = {}
++
++        if opacity_weight > 0.0:
++            opacity_loss = create_opacity_loss(masks, weight=1.0)
++            self.aov_loss_fns['opacity'] = (opacity_loss, opacity_weight)
++
++        if empty_space_weight > 0.0:
++            empty_space_loss = create_empty_space_loss(masks, weight=1.0)
++            self.aov_loss_fns['empty_space'] = (empty_space_loss, empty_space_weight)
++
++        # If no losses were added, set to None
++        if not self.aov_loss_fns:
++            self.aov_loss_fns = None
++
++    @dr.syntax
++    def sample_aovs(self, mode, scene, sampler, ray, δaovs, state_in, active, **kwargs):
++        """
++        Render AOVs (throughput, depth, normals) with radiative backpropagation.
++
++        This is a parallel rendering pass to sample() that computes AOVs with
++        proper gradient propagation. Throughput gradients use radiative backprop
++        assuming unit emission (Le=1) everywhere.
++
++        Args:
++            mode: dr.ADMode.Primal or dr.ADMode.Backward
++            scene: Mitsuba scene
++            sampler: Sampler for random numbers
++            ray: Rays to render
++            δaovs: Dict of AOV gradients for backward pass (None in forward)
++                   Keys: 'throughput', 'depth', 'normal'
++                   Values: gradients or None
++            state_in: State from forward pass (None in forward, throughput in backward)
++            active: Active ray mask
++            **kwargs: Additional arguments (spn_alpha, etc.)
++
++        Returns:
++            (aovs_dict, valid, state_out)
++            - aovs_dict: Dict with keys 'throughput', 'depth', 'normal'
++                        In primal mode: contains rendered AOV values
++                        In backward mode: contains gradients (or None if no gradient)
++            - valid: mi.Bool - ray validity
++            - state_out: State for backward pass
++        """
++        raise NotImplementedError("sample_aovs() must be implemented by subclass")
++
++    # ========== Common Helper Functions for AOV Rendering ==========
++
++    def compute_density_gradient(self, p, epsilon=1e-4):
++        """
++        Compute numerical gradient of density at point p using finite differences.
++
++        Args:
++            p: Query point (3D position)
++            epsilon: Finite difference step size
++
++        Returns:
++            Density gradient vector (∇σ)
++        """
++        grad_x = (self.sigmat.eval(dr.clip(p, 0.0, 1.0) + mi.Vector3f(epsilon, 0, 0))[0] -
++                 self.sigmat.eval(dr.clip(p, 0.0, 1.0) - mi.Vector3f(epsilon, 0, 0))[0]) / (2 * epsilon)
++        grad_y = (self.sigmat.eval(dr.clip(p, 0.0, 1.0) + mi.Vector3f(0, epsilon, 0))[0] -
++                 self.sigmat.eval(dr.clip(p, 0.0, 1.0) - mi.Vector3f(0, epsilon, 0))[0]) / (2 * epsilon)
++        grad_z = (self.sigmat.eval(dr.clip(p, 0.0, 1.0) + mi.Vector3f(0, 0, epsilon))[0] -
++                 self.sigmat.eval(dr.clip(p, 0.0, 1.0) - mi.Vector3f(0, 0, epsilon))[0]) / (2 * epsilon)
++        return mi.Vector3f(grad_x, grad_y, grad_z)
++
++    def compute_normal_from_density_gradient(self, density_grad):
++        """
++        Compute surface normal from density gradient.
++
++        The normal points in the direction of decreasing density (negative gradient).
++
++        Args:
++            density_grad: Gradient of density (∇σ)
++
++        Returns:
++            Normalized normal vector (-∇σ / ||∇σ||)
++        """
++        grad_length = dr.norm(density_grad)
++        return dr.select(grad_length > 1e-6,
++                        -density_grad / grad_length,
++                        mi.Vector3f(0.0))
++
++    def compute_depth_gradient_term(self, depth_contrib):
++        """
++        Compute ∂(output_depth)/∂(current_sample).
++
++        For depth, the gradient term is simply the depth contribution itself,
++        since depth accumulates linearly.
++
++        Args:
++            depth_contrib: Depth contribution at current sample
++
++        Returns:
++            Gradient term to multiply by δdepth
++        """
++        return depth_contrib
++
++    def compute_normal_gradient_term(self, normal_contrib, δnormal, normal_out, normal_accum_length):
++        """
++        Compute ∂(output_normal)/∂(current_sample) accounting for normalization.
++
++        Given output_normal = normalize(accumulated_normal), this computes how
++        the normalized output changes with respect to a contribution.
++
++        Using the gradient of normalization:
++        ∂normalize(v)/∂v = (I - n⊗n) / ||v||
++        where n = normalize(v)
++
++        This transforms δnormal (gradient w.r.t. normalized output) to the gradient
++        w.r.t. the unnormalized contribution.
++
++        Args:
++            normal_contrib: Normal contribution at current sample (unnormalized)
++            δnormal: Gradient w.r.t. normalized output normal (constant, not evolved)
++            normal_out: Normalized output normal (from forward pass)
++            normal_accum_length: Length of accumulated (unnormalized) normal
++
++        Returns:
++            Gradient term (vector) to multiply component-wise with normal_contrib
++        """
++        # Transform δnormal through normalization gradient
++        # ∂normalize(v)/∂v = (I - n⊗n) / ||v||
++        projection = dr.dot(normal_out, δnormal)
++        normal_grad_term = (δnormal - normal_out * projection) / dr.maximum(normal_accum_length, 1e-8)
++        return normal_grad_term
++
++    # ========== Common Utility Helper Functions ==========
++
++    def _setup_ray_bbox_intersection(self, ray, active, primal, has_gradients=True):
++        """
++        Setup ray and bounding box intersection with early termination logic.
++
++        Args:
++            ray: Input ray (will be converted to mi.Ray3f)
++            active: Active lanes mask
++            primal: Whether in primal (forward) or backward mode
++            has_gradients: Whether gradients are non-zero (for early termination in backward)
++
++        Returns:
++            (ray, mint, maxt, active) tuple
++        """
++        ray = mi.Ray3f(ray)
++        hit, mint, maxt = self.bbox.ray_intersect(ray)
++        active = mi.Bool(active)
++        active &= hit  # Ignore rays that miss the bbox
++
++        # Early termination in backward mode if no gradients
++        if not primal and not has_gradients:
++            active = mi.Bool(False)
++
++        return ray, mint, maxt, active
++
++    def _apply_spn_noise(self, p, spn_alpha, sampler, active):
++        """
++        Apply stochastic preconditioning noise to query point.
++
++        Args:
++            p: Query point (3D position)
++            spn_alpha: Noise scale parameter
++            sampler: Random number sampler
++            active: Active lanes mask
++
++        Returns:
++            Perturbed query point (or original if spn_alpha <= 0)
++        """
++        if spn_alpha > 0.0:
++            noise = mi.Vector3f(
++                sampler.next_1d(active) * 2.0 - 1.0,
++                sampler.next_1d(active) * 2.0 - 1.0,
++                sampler.next_1d(active) * 2.0 - 1.0
++            )
++            noise_scale = spn_alpha / self.grid_res
++            return p + noise * noise_scale
++        return p
++
++    def _eval_density(self, p, clip_bounds=True, use_majorant=False, majorant=None):
++        """
++        Evaluate density at query point with optional clipping and majorant clamping.
++
++        Args:
++            p: Query point
++            clip_bounds: Whether to clip point to [0, 1]^3
++            use_majorant: Whether to clamp density to majorant (for RT/DRT)
++            majorant: Majorant value (required if use_majorant=True)
++
++        Returns:
++            Density value (σ)
++        """
++        pos = dr.clip(p, 0.0, 1.0) if clip_bounds else p
++        sigmat = self.sigmat.eval(pos)[0]
++
++        if self.use_relu:
++            if use_majorant and majorant is not None:
++                sigmat = dr.clip(sigmat, 0.0, majorant)
++            else:
++                sigmat = dr.maximum(sigmat, 0.0)
++        elif use_majorant and majorant is not None:
++            sigmat = dr.minimum(sigmat, majorant)
++
++        return sigmat
++
++    def _compute_aov_contributions(self, t, weight, p_query, compute_normal=True):
++        """
++        Compute AOV contributions (depth and normal) at current sample.
++
++        Args:
++            t: Distance along ray
++            weight: Weighting factor (e.g., (1 - tr) * β or interaction_mask)
++            p_query: Query point for normal computation
++            compute_normal: Whether to compute normal (can be expensive)
++
++        Returns:
++            (depth_contrib, normal_contrib) tuple
++        """
++        # Depth contribution
++        depth_contrib = t * weight
++
++        # Normal contribution
++        if compute_normal:
++            density_grad = self.compute_density_gradient(p_query)
++            normal_at_p = self.compute_normal_from_density_gradient(density_grad)
++            normal_contrib = normal_at_p * weight
++        else:
++            normal_contrib = mi.Vector3f(0.0)
++
++        return depth_contrib, normal_contrib
++
++    def _normalize_normal_output(self, normal_accum):
++        """
++        Normalize accumulated normal vector.
++
++        Args:
++            normal_accum: Accumulated (unnormalized) normal vector
++
++        Returns:
++            (normal_out, normal_accum_length) tuple
++        """
++        normal_accum_length = dr.norm(normal_accum)
++        normal_out = dr.select(normal_accum_length > 1e-6,
++                              normal_accum / normal_accum_length,
++                              mi.Vector3f(0.0))
++        return normal_out, normal_accum_length
++
++    # ========== Gradient Propagation Helper Functions ==========
++
++    def propagate_depth_gradient(self, δdepth, depth_contrib):
++        """
++        Propagate depth gradient through backward pass.
++
++        This is a convenience function that combines gradient term computation
++        and dr.backward_from() into a single call.
++
++        Args:
++            δdepth: Gradient w.r.t. output depth (or None)
++            depth_contrib: Depth contribution at current sample
++
++        Returns:
++            None (accumulates gradients on parameters)
++        """
++        if δdepth is not None:
++            depth_grad_term = self.compute_depth_gradient_term(depth_contrib)
++            dr.backward_from(δdepth * depth_grad_term)
++
++    def propagate_normal_gradient(self, δnormal, normal_contrib, state_in):
++        """
++        Propagate normal gradient through backward pass.
++
++        This is a convenience function that combines gradient term computation
++        (with normalization handling) and dr.backward_from() into a single call.
++
++        Args:
++            δnormal: Gradient w.r.t. output normal (or None)
++            normal_contrib: Normal contribution at current sample
++            state_in: State dict containing 'normal_out' and 'normal_accum_length'
++
++        Returns:
++            None (accumulates gradients on parameters)
++        """
++        if δnormal is not None:
++            # Extract state for normalization
++            normal_out = state_in.get('normal_out', mi.Vector3f(0.0)) if isinstance(state_in, dict) else mi.Vector3f(0.0)
++            normal_accum_length = state_in.get('normal_accum_length', mi.Float(1.0)) if isinstance(state_in, dict) else mi.Float(1.0)
++
++            # Compute gradient term and propagate
++            normal_grad_term = self.compute_normal_gradient_term(
++                normal_contrib, δnormal, normal_out, normal_accum_length
++            )
++            dr.backward_from(δnormal * normal_grad_term)
++
++    def propagate_point_losses(self, point_loss_fns, point_data):
++        """
++        Propagate gradients from point-dependent loss functions.
++
++        Point-dependent losses are applied at each sample point during the backward pass.
++        Unlike AOV losses which accumulate across the ray, point losses are applied locally.
++
++        Args:
++            point_loss_fns: Dict mapping loss names to (loss_fn, weight) tuples
++            point_data: Dict containing point-specific data to pass to loss functions.
++                       Expected keys depend on the loss function, but may include:
++                       - 'normal_at_p': Normal vector at the sample point
++                       - 'position': 3D position of the sample
++                       - 'ray_d': Direction of the ray
++                       - 'sigmat': Density at the sample point
++                       - 'Le': Emitted light at the sample point
++                       - etc.
++
++        Returns:
++            None (accumulates gradients on parameters using dr.backward_from())
++        """
++        if point_loss_fns is None:
++            return
++
++        # Call each point loss function and propagate gradients
++        for loss_name, (loss_fn, loss_weight) in point_loss_fns.items():
++            # Call loss function with point data as keyword arguments
++            loss_value = loss_fn(**point_data)
++
++            # Apply weight and propagate gradient
++            weighted_loss = loss_value * loss_weight
++            dr.backward_from(weighted_loss)
++
+     def render_rays(self,
+                       rays: mi.Ray3f,
+                       sampler: mi.Sampler,
+@@ -153,7 +507,7 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
+                             sampler: mi.Sampler,
+                             scene: mi.Scene,
+                             loss_fn,
+-                            aov_loss_fn=None,
++                            point_loss_fns=None,
+                             target_aovs=None,
+                             spp: int = 1,
+                             **kwargs) -> Tuple[mi.Spectrum, mi.Float, list]:
+@@ -188,14 +542,21 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
+             scene: Mitsuba scene
+             loss_fn: REQUIRED loss function for colors. Should take (rendered, target)
+                     and return a scalar loss. No default provided.
+-            aov_loss_fn: Optional loss function for AOVs. Can take (rendered_aovs, target_aovs)
+-                        or just (rendered_aovs) for regularization. Returns scalar loss.
+-                        If None, no AOV loss is computed.
++            point_loss_fns: Optional dict mapping loss names to (loss_fn, weight) tuples for
++                           point-dependent losses. These are applied at each sample point during
++                           the backward pass. Each loss function receives point-specific data
++                           as keyword arguments (normal_at_p, position, Le, etc.) and returns a scalar loss.
++                           If None, no point-dependent losses are computed.
+             target_aovs: Optional list of target AOV values. Can be None if using
+-                        aov_loss_fn for regularization only.
++                        self.aov_loss_fns for regularization only.
+             spp: Samples per pixel (number of times to render each ray). Default: 1
+             **kwargs: Additional arguments passed to sample() (e.g., spn_alpha)
+ 
++        Note:
++            AOV losses are configured via self.aov_loss_fns (set using set_default_aov_losses()
++            or by directly assigning a dict of (loss_fn, weight) tuples). If self.aov_loss_fns
++            is None, no AOV loss is computed.
++
+         Returns:
+             Tuple of (rendered_colors, loss, aovs):
+                 - rendered_colors: Rendered radiance values (detached)
+@@ -215,80 +576,81 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
+             ... )
+             >>> opt.step()  # Update parameters using accumulated gradients
+ 
+-            >>> # Using loss for both colors and AOVs (supervised auxiliary task)
+-            >>> def depth_loss(rendered_aovs, target_aovs):
+-            ...     # AOVs[0] is depth, supervise with target
+-            ...     return dr.mean(dr.square(rendered_aovs[0] - target_aovs[0]))
++            >>> # Set up AOV losses (opacity + empty space)
++            >>> integrator.set_default_aov_losses(masks, opacity_weight=1.0, empty_space_weight=0.1)
+             >>> rendered, loss, aovs = integrator.render_rays_with_gradient(
+             ...     rays, target_colors, sampler, scene,
+-            ...     loss_fn=l2_loss,
+-            ...     aov_loss_fn=depth_loss,
+-            ...     target_aovs=[target_depth]
++            ...     loss_fn=l2_loss
+             ... )
+             >>> opt.step()
+ 
+-            >>> # Using AOV regularizer (no target AOVs needed)
+-            >>> def sparsity_regularizer(rendered_aovs):
+-            ...     # Regularize AOV[0] to be sparse
+-            ...     return 0.01 * dr.mean(dr.abs(rendered_aovs[0]))
++            >>> # Or set custom AOV losses directly
++            >>> def custom_aov_loss(aovs_dict):
++            ...     return dr.mean(dr.square(aovs_dict['depth'] - target_depth))
++            >>> integrator.aov_loss_fns = {'custom': (custom_aov_loss, 0.5)}
+             >>> rendered, loss, aovs = integrator.render_rays_with_gradient(
+             ...     rays, target_colors, sampler, scene,
+-            ...     loss_fn=l2_loss,
+-            ...     aov_loss_fn=sparsity_regularizer
++            ...     loss_fn=l2_loss
+             ... )
+             >>> opt.step()
+         """
+         # Wrap everything in suspend_grad to prevent automatic differentiation
+         # through the integrator's complex loops
+         with dr.suspend_grad():
+-            # ========== STEP 1: Uncorrelated forward pass (averaged over spp) ==========
+-            # Following Mitsuba's RBIntegrator.render_backward() pattern
+-            # Average over multiple samples to get stable L for gradient computation
+-            L_accum = None
+-            aovs_accum = None
+-
+-            for sample_idx in range(spp):
+-                L_sample, valid, aovs_sample, state_out = self.render_rays(
+-                    rays, sampler, scene, **kwargs
++            # Set sample count for multi-sampling
++            sampler.set_sample_count(spp)
++
++            # Add point_loss_fns to kwargs so it gets passed to sample methods
++            if point_loss_fns is not None:
++                kwargs['point_loss_fns'] = point_loss_fns
++
++            # ========== STEP 1: Uncorrelated forward pass (spp handled internally) ==========
++            L, valid, aovs, state_out = self.render_rays(
++                rays, sampler, scene, **kwargs
++            )
++
++            # ========== STEP 1.5: Render AOVs using sample_aovs() (if self.aov_loss_fns provided) ==========
++            aovs_dict = {}
++            aov_state = None
++
++            if self.aov_loss_fns is not None:
++                # Forward pass: render AOVs with unit emission
++                aovs_dict, aov_valid, aov_state = self.sample_aovs(
++                    mode=dr.ADMode.Primal,
++                    scene=scene,
++                    sampler=sampler,
++                    ray=rays,
++                    δaovs=None,
++                    state_in=None,
++                    active=mi.Bool(True),
++                    **kwargs
+                 )
+ 
+-                # Accumulate results
+-                if L_accum is None:
+-                    L_accum = L_sample
+-                else:
+-                    L_accum += L_sample
+-
+-                # Accumulate AOVs
+-                if aovs_sample and len(aovs_sample) > 0:
+-                    if aovs_accum is None:
+-                        aovs_accum = list(aovs_sample)
+-                    else:
+-                        for i, aov in enumerate(aovs_sample):
+-                            aovs_accum[i] += aov
+-
+-            # Average over samples
+-            L = L_accum / float(spp)
+-            aovs = [aov / float(spp) for aov in aovs_accum] if aovs_accum else []
+-
+-            # ========== STEP 2: Compute gradients from averaged L and AOVs ==========
++            # ========== STEP 2: Compute gradients from rendered values ==========
+             # Use dr.resume_grad() to enable gradient tracking locally for loss computation
+             with dr.resume_grad():
+                 # Enable gradient tracking on rendered colors (adjoint radiance)
+                 dr.enable_grad(L)
+ 
+-                # Enable gradient tracking on AOVs if we have an AOV loss function
+-                δaovs = None
+-                if aov_loss_fn is not None and len(aovs) > 0:
+-                    # Enable gradient tracking on each AOV
+-                    for aov in aovs:
+-                        dr.enable_grad(aov)
++                # Enable gradient tracking on all AOVs
++                if self.aov_loss_fns is not None and aovs_dict:
++                    for aov in aovs_dict.values():
++                        if aov is not None:
++                            dr.enable_grad(aov)
+ 
+                 # Compute color loss (required)
+                 loss = loss_fn(L, target_colors)
+ 
+                 # Add AOV loss if loss function provided
+-                if aov_loss_fn is not None and len(aovs) > 0:
+-                    aov_loss = aov_loss_fn(aovs)
++                if self.aov_loss_fns is not None and aovs_dict:
++                    # Dict mapping loss names to loss functions
++                    # Each loss function receives the entire aovs_dict
++                    aov_loss = mi.Float(0.0)
++
++                    for loss_name, (loss_fn_i, loss_weight_i) in self.aov_loss_fns.items():
++                        individual_loss = loss_fn_i(aovs_dict) * loss_weight_i
++                        aov_loss = aov_loss + individual_loss
++
+                     loss = loss + aov_loss
+ 
+                 # Backward through loss to get gradients w.r.t. rendered colors and AOVs
+@@ -296,136 +658,39 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
+ 
+                 # Extract gradient (adjoint radiance δL)
+                 δL = dr.grad(L)
+-
+-                # Extract AOV gradients (δaovs) if AOV loss function was used
+-                if aov_loss_fn is not None and len(aovs) > 0:
+-                    δaovs = [dr.grad(aov) for aov in aovs]
+-
+-            # ========== STEP 3: Correlated forward + backward passes (one per spp) ==========
+-            # For each sample: do correlated forward pass + backward pass
+-            # Gradients accumulate in parameters
+-            for sample_idx in range(spp):
+-                # Forward pass for PRB (correlated with backward pass via sampler state)
+-                L_sample, valid, aovs_sample, state_out = self.render_rays(
+-                    rays, sampler.clone(), scene, **kwargs
+-                )
+-
+-                δL_scaled = δL / float(spp)
+-                δaovs_scaled = [δaov / float(spp) for δaov in δaovs] if δaovs is not None else None
+-                self.render_backward_rays(rays, sampler, scene, δL_scaled, state_out,
+-                                            δaovs=δaovs_scaled, **kwargs)
+-
+-        return L, loss, aovs
+-
+-    def render_camera(self,
+-                      sensor: mi.Sensor,
+-                      sampler: mi.Sampler,
+-                      scene: mi.Scene,
+-                      spp: int = 1,
+-                      **kwargs) -> Tuple[mi.TensorXf, list]:
+-        """
+-        Render an image from a camera/sensor.
+-
+-        This is a convenience method that generates rays for all pixels in the
+-        sensor's film and renders them using render_rays(). It replaces the need
+-        to use mi.render() which doesn't work well with integrators that return AOVs.
+-
+-        Args:
+-            sensor: Mitsuba sensor/camera to render from
+-            sampler: Sampler for random number generation
+-            scene: Mitsuba scene
+-            spp: Samples per pixel (default: 1)
+-            **kwargs: Additional arguments passed to render_rays() (e.g., spn_alpha)
+-
+-        Returns:
+-            Tuple of (rgb_image, aovs):
+-                - rgb_image: RGB image as TensorXf with shape (height, width, 3)
+-                - aovs: List of AOV images as TensorXf with shape (height, width, channels)
+-
+-        Example:
+-            >>> sensor = data['test_sensors'][0]
+-            >>> sampler = mi.load_dict({'type': 'independent', 'sample_count': 16})
+-            >>> rgb, aovs = integrator.render_camera(sensor, sampler, scene, spp=16)
+-            >>> depth = aovs[0]  # First AOV is depth
+-        """
+-        with dr.suspend_grad():
+-            # Get film resolution
+-            film = sensor.film()
+-            film_size = film.size()
+-            width, height = film_size[0], film_size[1]
+-            num_pixels = width * height
+-
+-            # Accumulate multiple samples per pixel
+-            L_accum = None
+-            aovs_accum = None
+-
+-            for sample_idx in range(spp):
+-                # VECTORIZED: Create all pixel indices at once
+-                idx = dr.arange(mi.UInt32, num_pixels)
+-                x = idx % width
+-                y = idx // width
+-
+-                # Convert to normalized coordinates [0, 1]
+-                # Add random offset for stratified sampling (when spp > 1)
+-                if spp > 1:
+-                    # Stratified sampling with random jitter
+-                    rng = np.random.RandomState(sample_idx)
+-                    offset_x = rng.rand()
+-                    offset_y = rng.rand()
+-                else:
+-                    # Single sample: use pixel center
+-                    offset_x = 0.5
+-                    offset_y = 0.5
+-
+-                pos_x = (mi.Float(x) + offset_x) / float(width)
+-                pos_y = (mi.Float(y) + offset_y) / float(height)
+-                pos_sample = mi.Point2f(pos_x, pos_y)
+-
+-                # VECTORIZED: Sample all rays at once
+-                time_sample = mi.Float(0.0)
+-                wavelength_sample = mi.Float(0.5)
+-                aperture_sample = mi.Point2f(0.5, 0.5)
+-
+-                rays, _ = sensor.sample_ray(time_sample, wavelength_sample, pos_sample, aperture_sample)
+-
+-                # Render all rays
+-                L, valid, aovs, state = self.render_rays(
+-                    rays, sampler, scene, **kwargs
++                # Set to None if all gradients are zero
++                if not dr.any(δL != 0, axis=None):
++                    δL = None
++
++                # Extract gradients for each AOV using dict comprehension
++                δaovs_dict = None
++                if self.aov_loss_fns is not None and aovs_dict:
++                    δaovs_dict = {}
++                    for k, v in aovs_dict.items():
++                        if v is not None:
++                            grad = dr.grad(v)
++                            # Set to None if all gradients are zero
++                            if not dr.any(grad != 0, axis=None):
++                                grad = None
++                            δaovs_dict[k] = grad
++                        else:
++                            δaovs_dict[k] = None
++
++            # ========== STEP 3: Backward pass ==========
++            # Backward pass for color gradients
++            self.render_backward_rays(rays, sampler, scene, δL, state_out, **kwargs)
++
++            # Backward pass for AOV gradients
++            if self.aov_loss_fns is not None and δaovs_dict is not None:
++                self.sample_aovs(
++                    mode=dr.ADMode.Backward,
++                    scene=scene,
++                    sampler=sampler,
++                    ray=rays,
++                    δaovs=δaovs_dict,
++                    state_in=aov_state,
++                    active=mi.Bool(True),
++                    **kwargs
+                 )
+ 
+-                # Accumulate results
+-                if L_accum is None:
+-                    L_accum = L
+-                else:
+-                    L_accum += L
+-
+-                # Accumulate AOVs
+-                if aovs and len(aovs) > 0:
+-                    if aovs_accum is None:
+-                        aovs_accum = list(aovs)
+-                    else:
+-                        for i, aov in enumerate(aovs):
+-                            aovs_accum[i] += aov
+-
+-            # Average over samples
+-            L = L_accum / float(spp)
+-            aovs = [aov / float(spp) for aov in aovs_accum] if aovs_accum else []
+-
+-            # Reshape to image dimensions (avoid unnecessary conversions)
+-            # L is mi.Spectrum, reshape directly to (height, width, 3)
+-            rgb_image = dr.reshape(mi.TensorXf, L, shape=[height, width, 3])
+-
+-            # Reshape AOVs
+-            aov_images = []
+-            for aov in aovs:
+-                # Check if scalar or vector AOV by looking at the total size
+-                total_size = dr.width(aov)
+-                if total_size == num_pixels:
+-                    # Scalar AOV (e.g., depth)
+-                    aov_images.append(dr.reshape(mi.TensorXf, aov, shape=[height, width]))
+-                else:
+-                    # Vector AOV (e.g., normals) - assume channels divide evenly
+-                    channels = total_size // num_pixels
+-                    aov_images.append(dr.reshape(mi.TensorXf, aov, shape=[height, width, channels]))
+-
+-        return rgb_image, aov_images
++        return L, loss, aovs_dict

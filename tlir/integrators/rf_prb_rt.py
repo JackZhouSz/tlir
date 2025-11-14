@@ -71,13 +71,9 @@ class RadianceFieldPRBRT(TLIRIntegrator):
         # Extract stochastic preconditioning alpha from kwargs
         spn_alpha = kwargs.get('spn_alpha', 0.0)
 
-        ray = mi.Ray3f(ray)
-        hit, mint, maxt = self.bbox.ray_intersect(ray)
-
-        active = mi.Bool(active)
-        active &= hit  # ignore rays that miss the bbox
-        if not primal:  # if the gradient is zero, stop early
-            active &= dr.any(δL != 0)
+        # Setup ray-bbox intersection with early termination
+        has_grad = dr.any(δL != 0) if not primal else True
+        ray, mint, maxt, active = self._setup_ray_bbox_intersection(ray, active, primal, has_grad)
 
         L = mi.Spectrum(0.0 if primal else state_in)
         δL = mi.Spectrum(δL if δL is not None else 0)
@@ -92,26 +88,14 @@ class RadianceFieldPRBRT(TLIRIntegrator):
 
         while active:
             # Sample next interaction distance using majorant
-            # -log(1 - ξ) / σ_majorant where ξ is uniform random
             u = dr.clip(sampler.next_1d(active), 0.0, 1.0 - 1e-6)
 
-            # Get current majorant value at current position
+            # Get majorant at current position
             p = ray(t)
-
-            # Apply stochastic preconditioning to first query
-            p_query = p
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0
-                )
-                noise_scale = spn_alpha / self.grid_res
-                p_query = p + noise * noise_scale
-
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
             majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
 
-            # Get steps size
+            # Compute step size
             dt = dr.maximum(-dr.log(1.0 - u) / majorant, self.min_step_size)
             t += dt
             num_steps += 1
@@ -120,28 +104,14 @@ class RadianceFieldPRBRT(TLIRIntegrator):
             active &= (t < maxt)
             active &= (num_steps < self.max_num_steps)
 
-            # Update ray position
+            # Update ray position and evaluate density
             p = ray(t)
-
-            # Apply stochastic preconditioning to second query
-            p_query = p
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0
-                )
-                noise_scale = spn_alpha / self.grid_res
-                p_query = p + noise * noise_scale
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
 
             with dr.resume_grad(when=not primal):
-                # Get actual extinction coefficient at this point
+                # Get majorant and actual extinction coefficient
                 majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
-
-                if self.use_relu:
-                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], 0.0, majorant)
-                else:
-                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], majorant)
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
 
                 if self.stopgrad_density:
                     sigmat = dr.detach(sigmat)
@@ -166,18 +136,10 @@ class RadianceFieldPRBRT(TLIRIntegrator):
 
             with dr.resume_grad(when=not primal):
                 if not primal:
-                    if self.stopgrad_density:
-                        dr.backward_from(δL * Le)
-                    else:
-                        dr.backward_from(
-                            δL * 
-                            (
-                                sigmat * dr.detach(Le / sigmat)
-                                + Le
-                                # - trans_grad_buffer * dr.detach(L + Le) * interaction_mask
-                                - trans_grad_buffer * dr.detach(Le) * interaction_mask
-                            )
-                        )
+                    # Propagate radiance gradient using helper
+                    self.propagate_radiance_gradient_rt(δL, sigmat, trans_grad_buffer, interaction_mask, Le)
+
+                    # TODO: Point-dependent losses can be added here if needed
 
             if should_interact:
                 trans_grad_buffer = mi.Float(0.0)
@@ -193,6 +155,215 @@ class RadianceFieldPRBRT(TLIRIntegrator):
             active &= dr.any(mi.Spectrum(Tr) > self.min_throughput)
 
         return L if primal else δL, mi.Bool(True), [], L
+
+    def compute_throughput_gradient_term_rt(self, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
+        """Compute ∂(output_throughput)/∂(current_sample) for ratio tracking."""
+        return (sigmat * dr.detach(Le / sigmat) + Le -
+                trans_grad_buffer * dr.detach(Le) * interaction_mask)
+
+    def propagate_throughput_gradient_rt(self, δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
+        """
+        Propagate throughput gradient through backward pass (ratio tracking).
+
+        Args:
+            δL_throughput: Gradient w.r.t. output throughput (or None)
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
+            Le: Emission at current sample (default 1.0)
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL_throughput is not None:
+            throughput_grad_term = self.compute_throughput_gradient_term_rt(
+                sigmat, trans_grad_buffer, interaction_mask, Le
+            )
+            dr.backward_from(δL_throughput * throughput_grad_term)
+
+    def compute_radiance_gradient_term_rt(self, sigmat, trans_grad_buffer, interaction_mask, Le):
+        """
+        Compute ∂(output_radiance)/∂(current_sample) for ratio tracking.
+
+        Same formula as throughput, but with arbitrary emission Le.
+
+        Args:
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
+            Le: Emission at current sample
+
+        Returns:
+            Gradient term to multiply by δL
+        """
+        return self.compute_throughput_gradient_term_rt(sigmat, trans_grad_buffer, interaction_mask, Le)
+
+    def propagate_radiance_gradient_rt(self, δL, sigmat, trans_grad_buffer, interaction_mask, Le):
+        """
+        Propagate radiance gradient through backward pass (ratio tracking).
+
+        Handles both stopgrad_density cases:
+        - If stopgrad_density: simple dr.backward_from(δL * Le)
+        - Otherwise: full gradient with transmittance term
+
+        Args:
+            δL: Gradient w.r.t. output radiance (or None)
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
+            Le: Emission at current sample
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL is not None:
+            if self.stopgrad_density:
+                dr.backward_from(δL * Le)
+            else:
+                radiance_grad_term = self.compute_radiance_gradient_term_rt(
+                    sigmat, trans_grad_buffer, interaction_mask, Le
+                )
+                dr.backward_from(δL * radiance_grad_term)
+
+    @dr.syntax
+    def sample_aovs(self, mode, scene, sampler, ray, δaovs, state_in, active, **kwargs):
+        """Render AOVs using ratio tracking with radiative backpropagation."""
+        primal = mode == dr.ADMode.Primal
+        spn_alpha = kwargs.get('spn_alpha', 0.0)
+
+        # Extract gradients from dict
+        δL_throughput = None
+        δdepth = None
+        δnormal = None
+        if δaovs is not None and isinstance(δaovs, dict):
+            if δaovs.get('throughput') is not None:
+                δL_throughput = mi.Float(δaovs['throughput'])
+            if δaovs.get('depth') is not None:
+                δdepth = mi.Float(δaovs['depth'])
+            if δaovs.get('normal') is not None:
+                δnormal = mi.Vector3f(δaovs['normal'])
+
+        ray = mi.Ray3f(ray)
+        hit, mint, maxt = self.bbox.ray_intersect(ray)
+
+        active = mi.Bool(active)
+        active &= hit
+        if not primal:
+            has_grad = mi.Bool(False)
+            if δL_throughput is not None:
+                has_grad |= dr.any(δL_throughput != 0)
+            if δdepth is not None:
+                has_grad |= dr.any(δdepth != 0)
+            if δnormal is not None:
+                has_grad |= dr.any(δnormal != 0)
+            active &= has_grad
+
+        # Initialize state
+        if primal:
+            L_throughput = mi.Float(0.0)
+        else:
+            L_throughput = state_in.get('throughput', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
+
+        # AOV accumulators
+        depth = mi.Float(0.0)
+        normal_accum = mi.Vector3f(0.0)
+
+        # Ratio tracking variables
+        t = mi.Float(mint)
+        num_steps = mi.Int32(0)
+        trans_grad_buffer = mi.Float(0.0)
+
+        while active:
+            u = dr.clip(sampler.next_1d(active), 0.0, 1.0 - 1e-6)
+            p = ray(t)
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
+
+            majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+            dt = dr.maximum(-dr.log(1.0 - u) / majorant, self.min_step_size)
+            t += dt
+            num_steps += 1
+
+            active &= (t < maxt)
+            active &= (num_steps < self.max_num_steps)
+
+            p = ray(t)
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
+
+            with dr.resume_grad(when=not primal):
+                majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
+
+                if self.stopgrad_density:
+                    sigmat = dr.detach(sigmat)
+
+                interaction_prob = sigmat / majorant
+                should_interact = sampler.next_1d(active) < interaction_prob
+                interaction_mask = dr.select(should_interact, 1.0, 0.0)
+
+                # Unit emission
+                Le_aov = dr.select(should_interact, 1.0, 0.0)
+
+                # Depth contribution
+                depth_contrib = dr.select(should_interact, t * 1.0, 0.0)
+
+                # Normal contribution
+                density_grad = self.compute_density_gradient(p_query)
+                normal_at_p = self.compute_normal_from_density_gradient(density_grad)
+                normal_contrib = dr.select(should_interact, normal_at_p * 1.0, mi.Vector3f(0.0))
+
+                if not should_interact:
+                    trans_grad_buffer += sigmat
+
+            # Accumulate
+            if primal:
+                depth = depth + depth_contrib
+                normal_accum = normal_accum + normal_contrib
+            else:
+                depth = depth - depth_contrib
+                normal_accum = normal_accum - normal_contrib
+
+            L_throughput = Le_aov if primal else L_throughput - Le_aov
+
+            # BACKWARD PASS
+            with dr.resume_grad(when=not primal):
+                if not primal and not self.stopgrad_density:
+                    # Propagate gradients using convenience helpers
+                    self.propagate_throughput_gradient_rt(δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0)
+                    self.propagate_depth_gradient(δdepth, depth_contrib)
+                    self.propagate_normal_gradient(δnormal, normal_contrib, state_in)
+
+                    # TODO: Point-dependent losses can be added here if needed
+
+            if should_interact:
+                trans_grad_buffer = mi.Float(0.0)
+
+            active &= ~should_interact
+            active &= (interaction_prob < 1.0 - self.min_throughput)
+
+        # Normalize normal
+        normal_out, normal_accum_length = self._normalize_normal_output(normal_accum)
+
+        # Return dicts
+        if primal:
+            aovs_out = {
+                'throughput': L_throughput,
+                'depth': depth,
+                'normal': normal_out
+            }
+            state_out = {
+                'throughput': L_throughput,
+                'normal_out': normal_out,
+                'normal_accum_length': normal_accum_length
+            }
+        else:
+            aovs_out = {
+                'throughput': δL_throughput if δL_throughput is not None else None,
+                'depth': δdepth if δdepth is not None else None,
+                'normal': δnormal if δnormal is not None else None
+            }
+            state_out = {'throughput': L_throughput}
+
+        return aovs_out, mi.Bool(True), state_out
 
     def traverse(self, cb):
         """Return differentiable parameters for optimization."""

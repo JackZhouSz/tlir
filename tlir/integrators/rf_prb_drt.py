@@ -72,13 +72,9 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         # Extract stochastic preconditioning alpha from kwargs
         spn_alpha = kwargs.get('spn_alpha', 0.0)
 
-        ray = mi.Ray3f(ray)
-        hit, mint, maxt = self.bbox.ray_intersect(ray)
-
-        active = mi.Bool(active)
-        active &= hit  # ignore rays that miss the bbox
-        if not primal:  # if the gradient is zero, stop early
-            active &= dr.any(δL != 0)
+        # Setup ray-bbox intersection with early termination
+        has_grad = dr.any(δL != 0) if not primal else True
+        ray, mint, maxt, active = self._setup_ray_bbox_intersection(ray, active, primal, has_grad)
 
         L = mi.Spectrum(0.0 if primal else state_in)
         δL = mi.Spectrum(δL if δL is not None else 0)
@@ -98,26 +94,14 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         
         while active:
             # Sample next interaction distance using majorant
-            # -log(1 - ξ) / σ_majorant where ξ is uniform random
             u = dr.clip(sampler.next_1d(active), 0.0, 1.0 - 1e-6)
 
-            # Get current majorant value at current position
+            # Get majorant at current position
             p = ray(t)
-
-            # Apply stochastic preconditioning to first query
-            p_query = p
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0
-                )
-                noise_scale = spn_alpha / self.grid_res
-                p_query = p + noise * noise_scale
-
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
             majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
 
-            # Get steps size
+            # Compute step size
             dt = dr.maximum(-dr.log(1.0 - u) / majorant, self.min_step_size)
             t += dt
             num_steps += 1
@@ -128,17 +112,7 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
 
             # Update ray position
             p = ray(t)
-
-            # Apply stochastic preconditioning to second query
-            p_query = p
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0
-                )
-                noise_scale = spn_alpha / self.grid_res
-                p_query = p + noise * noise_scale
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
 
             # Reservoir sampling for DRT
             w_step = Tr * dt
@@ -151,13 +125,9 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
                 reservoir_dt = dt
 
             with dr.resume_grad(when=not primal):
-                # Get actual extinction coefficient at this point
+                # Get majorant and actual extinction coefficient
                 majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
-
-                if self.use_relu:
-                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], 0.0, majorant)
-                else:
-                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], majorant)
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
 
                 if self.stopgrad_density:
                     sigmat = dr.detach(sigmat)
@@ -181,17 +151,10 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
 
             with dr.resume_grad(when=not primal):
                 if not primal:
-                    if self.stopgrad_density:
-                        dr.backward_from(δL * Le)
-                    else:
-                        dr.backward_from(
-                            δL * 
-                            (
-                                sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
-                                + Le
-                                # - trans_grad_buffer * dr.detach(Le) * interaction_mask
-                            )
-                        )
+                    # Propagate radiance gradient using helper
+                    self.propagate_radiance_gradient_drt(δL, sigmat, trans_grad_buffer, interaction_mask, Le)
+
+                    # TODO: Point-dependent losses can be added here if needed
 
 
             # Update transmittance
@@ -213,33 +176,18 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         for _ in range(n_samples):
             new_t = sampler.next_1d(mi.Bool(True)) * interval + mint
             new_p = ray(new_t)
-
-            # Apply stochastic preconditioning to transmittance gradient query
-            new_p_query = new_p
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
-                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
-                    sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0
-                )
-                noise_scale = spn_alpha / self.grid_res
-                new_p_query = new_p + noise * noise_scale
+            new_p_query = self._apply_spn_noise(new_p, spn_alpha, sampler, mi.Bool(True))
 
             with dr.resume_grad():
                 majorant = self.majorant_grid.eval(dr.clip(new_p_query, 0.0, 1.0))[0]
-
-                if self.use_relu:
-                    sigmat = dr.clip(self.sigmat.eval(dr.clip(new_p_query, 0.0, 1.0))[0], 0.0, majorant)
-                else:
-                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(new_p_query, 0.0, 1.0))[0], majorant)
-
+                sigmat = self._eval_density(new_p_query, use_majorant=True, majorant=majorant)
                 trans_grad_buffer += sigmat
 
         inv_pdf = interval / n_samples
 
         with dr.resume_grad():
             trans_grad_buffer = dr.select(active, trans_grad_buffer, 0.)
-            dr.backward_from(-trans_grad_buffer * dr.detach(inv_pdf * L))
+            self.propagate_transmittance_gradient(trans_grad_buffer, inv_pdf, L)
 
         # DRT gradient update
         with dr.resume_grad(when=not primal):
@@ -249,34 +197,339 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
                 t += u * dt
 
                 p = ray(t)
-
-                # Apply stochastic preconditioning to DRT gradient update query
-                p_query = p
-                if spn_alpha > 0.0:
-                    noise = mi.Vector3f(
-                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
-                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0,
-                        sampler.next_1d(mi.Bool(True)) * 2.0 - 1.0
-                    )
-                    noise_scale = spn_alpha / self.grid_res
-                    p_query = p + noise * noise_scale
+                p_query = self._apply_spn_noise(p, spn_alpha, sampler, mi.Bool(True))
 
                 Le = self.eval_emission(p_query, ray.d)
 
                 majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
 
-                if self.use_relu:
-                    sigmat = dr.clip(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], 0.0, majorant)
-                else:
-                    sigmat = dr.minimum(self.sigmat.eval(dr.clip(p_query, 0.0, 1.0))[0], majorant)
-
-                dr.backward_from(
-                    δL * (
-                        sigmat * dr.detach(w_acc * Le / (sigmat * sigmat + 1.0))
-                    )
-                )
+                # Propagate reservoir gradient using helper
+                self.propagate_radiance_gradient_drt_reservoir(δL, sigmat, w_acc, Le)
 
         return L if primal else δL, mi.Bool(True), [], L
+
+    def compute_throughput_gradient_term_drt(self, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
+        """
+        Compute ∂(output_throughput)/∂(current_sample) for delta ratio tracking (main loop).
+
+        Similar to RT but with DRT-specific formulation.
+        """
+        return (sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
+                + Le)
+
+    def compute_throughput_gradient_term_drt_reservoir(self, sigmat, w_acc, Le=1.0):
+        """
+        Compute ∂(output_throughput)/∂(reservoir_sample) for delta ratio tracking.
+
+        This is the additional DRT-specific gradient from the reservoir sample.
+        """
+        return sigmat * dr.detach(w_acc * Le / (sigmat * sigmat + 1.0))
+
+    def propagate_throughput_gradient_drt(self, δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
+        """
+        Propagate throughput gradient through backward pass (delta ratio tracking, main loop).
+
+        Args:
+            δL_throughput: Gradient w.r.t. output throughput (or None)
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
+            Le: Emission at current sample (default 1.0)
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL_throughput is not None:
+            throughput_grad_term = self.compute_throughput_gradient_term_drt(
+                sigmat, trans_grad_buffer, interaction_mask, Le
+            )
+            dr.backward_from(δL_throughput * throughput_grad_term)
+
+    def propagate_throughput_gradient_drt_reservoir(self, δL_throughput, sigmat, w_acc, Le=1.0):
+        """
+        Propagate throughput gradient from reservoir sample (delta ratio tracking).
+
+        Args:
+            δL_throughput: Gradient w.r.t. output throughput (or None)
+            sigmat: Extinction coefficient at reservoir sample
+            w_acc: Accumulated weight for reservoir sampling
+            Le: Emission at current sample (default 1.0)
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL_throughput is not None:
+            throughput_grad_term = self.compute_throughput_gradient_term_drt_reservoir(sigmat, w_acc, Le)
+            dr.backward_from(δL_throughput * throughput_grad_term)
+
+    def compute_radiance_gradient_term_drt(self, sigmat, trans_grad_buffer, interaction_mask, Le):
+        """
+        Compute ∂(output_radiance)/∂(current_sample) for delta ratio tracking (main loop).
+
+        Same formula as throughput, but with arbitrary emission Le.
+
+        Args:
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient (unused in DRT main loop)
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise (unused in DRT main loop)
+            Le: Emission at current sample
+
+        Returns:
+            Gradient term to multiply by δL
+        """
+        return self.compute_throughput_gradient_term_drt(sigmat, trans_grad_buffer, interaction_mask, Le)
+
+    def propagate_radiance_gradient_drt(self, δL, sigmat, trans_grad_buffer, interaction_mask, Le):
+        """
+        Propagate radiance gradient through backward pass (delta ratio tracking, main loop).
+
+        Handles both stopgrad_density cases:
+        - If stopgrad_density: simple dr.backward_from(δL * Le)
+        - Otherwise: full DRT gradient with density dependence
+
+        Args:
+            δL: Gradient w.r.t. output radiance (or None)
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient (unused in DRT main loop)
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise (unused in DRT main loop)
+            Le: Emission at current sample
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL is not None:
+            if self.stopgrad_density:
+                dr.backward_from(δL * Le)
+            else:
+                radiance_grad_term = self.compute_radiance_gradient_term_drt(
+                    sigmat, trans_grad_buffer, interaction_mask, Le
+                )
+                dr.backward_from(δL * radiance_grad_term)
+
+    def compute_radiance_gradient_term_drt_reservoir(self, sigmat, w_acc, Le):
+        """
+        Compute ∂(output_radiance)/∂(reservoir_sample) for delta ratio tracking.
+
+        This is the additional DRT-specific gradient from the reservoir sample.
+
+        Args:
+            sigmat: Extinction coefficient at reservoir sample
+            w_acc: Accumulated weight for reservoir sampling
+            Le: Emission at current sample
+
+        Returns:
+            Gradient term to multiply by δL
+        """
+        return self.compute_throughput_gradient_term_drt_reservoir(sigmat, w_acc, Le)
+
+    def propagate_radiance_gradient_drt_reservoir(self, δL, sigmat, w_acc, Le):
+        """
+        Propagate radiance gradient from reservoir sample (delta ratio tracking).
+
+        Args:
+            δL: Gradient w.r.t. output radiance (or None)
+            sigmat: Extinction coefficient at reservoir sample
+            w_acc: Accumulated weight for reservoir sampling
+            Le: Emission at current sample
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δL is not None:
+            radiance_grad_term = self.compute_radiance_gradient_term_drt_reservoir(sigmat, w_acc, Le)
+            dr.backward_from(δL * radiance_grad_term)
+
+    def propagate_transmittance_gradient(self, trans_grad_buffer, inv_pdf, L):
+        """
+        Propagate transmittance gradient through backward pass.
+
+        This handles the negative transmittance contribution that comes from
+        unscattered samples in the null-scattering formulation.
+
+        Args:
+            trans_grad_buffer: Accumulated transmittance gradient from null samples
+            inv_pdf: Inverse PDF for the transmittance gradient estimator (interval / n_samples)
+            L: Current accumulated radiance
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        dr.backward_from(-trans_grad_buffer * dr.detach(inv_pdf * L))
+
+    @dr.syntax
+    def sample_aovs(self, mode, scene, sampler, ray, δaovs, state_in, active, **kwargs):
+        """Render AOVs using delta ratio tracking with radiative backpropagation."""
+        primal = mode == dr.ADMode.Primal
+        spn_alpha = kwargs.get('spn_alpha', 0.0)
+
+        # Extract gradients from dict
+        δL_throughput = None
+        δdepth = None
+        δnormal = None
+        if δaovs is not None and isinstance(δaovs, dict):
+            if δaovs.get('throughput') is not None:
+                δL_throughput = mi.Float(δaovs['throughput'])
+            if δaovs.get('depth') is not None:
+                δdepth = mi.Float(δaovs['depth'])
+            if δaovs.get('normal') is not None:
+                δnormal = mi.Vector3f(δaovs['normal'])
+
+        # Check if any gradients are non-zero (for early termination)
+        has_grad = True
+        if not primal:
+            has_grad = mi.Bool(False)
+            if δL_throughput is not None:
+                has_grad |= dr.any(δL_throughput != 0)
+            if δdepth is not None:
+                has_grad |= dr.any(δdepth != 0)
+            if δnormal is not None:
+                has_grad |= dr.any(δnormal != 0)
+
+        # Setup ray-bbox intersection with early termination
+        ray, mint, maxt, active = self._setup_ray_bbox_intersection(ray, active, primal, has_grad)
+
+        # Initialize state
+        if primal:
+            L_throughput = mi.Float(0.0)
+        else:
+            L_throughput = state_in.get('throughput', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
+
+        # AOV accumulators
+        depth = mi.Float(0.0)
+        normal_accum = mi.Vector3f(0.0)
+
+        # Ratio tracking and reservoir sampling variables
+        t = mi.Float(mint)
+        num_steps = mi.Int32(0)
+        Tr = mi.Float(1.0)
+        trans_grad_buffer = mi.Float(0.0)
+
+        # Reservoir sampling
+        w_acc = mi.Float(0.0)
+        reservoir_t = mi.Float(0.0)
+        reservoir_dt = mi.Float(0.0)
+
+        while active:
+            u = dr.clip(sampler.next_1d(active), 0.0, 1.0 - 1e-6)
+            p = ray(t)
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
+
+            majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+            dt = dr.maximum(-dr.log(1.0 - u) / majorant, self.min_step_size)
+            t += dt
+            num_steps += 1
+
+            active &= (t < maxt)
+            active &= (num_steps < self.max_num_steps)
+
+            p = ray(t)
+            p_query = self._apply_spn_noise(p, spn_alpha, sampler, active)
+
+            # Reservoir sampling
+            w_step = Tr * dt
+            w_acc += w_step
+
+            should_update_reservoir = (sampler.next_1d(active) * w_acc) < w_step
+
+            if should_update_reservoir:
+                reservoir_t = t
+                reservoir_dt = dt
+
+            with dr.resume_grad(when=not primal):
+                majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
+
+                if self.stopgrad_density:
+                    sigmat = dr.detach(sigmat)
+
+                interaction_prob = sigmat / majorant
+                should_interact = sampler.next_1d(active) < interaction_prob
+                interaction_mask = dr.select(should_interact, 1.0, 0.0)
+
+                # Unit emission
+                Le_aov = dr.select(should_interact, 1.0, 0.0)
+
+                # Depth contribution
+                depth_contrib = dr.select(should_interact, t * 1.0, 0.0)
+
+                # Normal contribution
+                density_grad = self.compute_density_gradient(p_query)
+                normal_at_p = self.compute_normal_from_density_gradient(density_grad)
+                normal_contrib = dr.select(should_interact, normal_at_p * 1.0, mi.Vector3f(0.0))
+
+                if not should_interact:
+                    trans_grad_buffer += sigmat
+
+            # Accumulate
+            if primal:
+                depth = depth + depth_contrib
+                normal_accum = normal_accum + normal_contrib
+            else:
+                depth = depth - depth_contrib
+                normal_accum = normal_accum - normal_contrib
+
+            L_throughput = Le_aov if primal else L_throughput - Le_aov
+
+            # BACKWARD PASS (main loop)
+            with dr.resume_grad(when=not primal):
+                if not primal and not self.stopgrad_density:
+                    # Propagate gradients using convenience helpers
+                    self.propagate_throughput_gradient_drt(δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0)
+                    self.propagate_depth_gradient(δdepth, depth_contrib)
+                    self.propagate_normal_gradient(δnormal, normal_contrib, state_in)
+
+                    # TODO: Point-dependent losses can be added here if needed
+
+            Tr *= (1 - interaction_prob)
+            Tr = dr.detach(Tr)
+
+            active &= ~should_interact
+            active &= dr.any(mi.Float(Tr) > self.min_throughput)
+
+        # DRT reservoir gradient update (additional gradient from reservoir)
+        with dr.resume_grad(when=not primal):
+            if not primal and not self.stopgrad_density:
+                t, dt = reservoir_t, reservoir_dt
+                u = dr.clip(sampler.next_1d(mi.Bool(True)), 1e-6, 1.0 - 1e-6)
+                t += u * dt
+
+                p = ray(t)
+                p_query = self._apply_spn_noise(p, spn_alpha, sampler, mi.Bool(True))
+
+                majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
+                sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
+
+                # Propagate throughput gradient from reservoir sample
+                self.propagate_throughput_gradient_drt_reservoir(δL_throughput, sigmat, w_acc, Le=1.0)
+
+                # Note: Depth and normal gradients are already handled in the main loop
+                # The reservoir sample is primarily for the throughput/radiance gradient
+
+        # Normalize normal
+        normal_out, normal_accum_length = self._normalize_normal_output(normal_accum)
+
+        # Return dicts
+        if primal:
+            aovs_out = {
+                'throughput': L_throughput,
+                'depth': depth,
+                'normal': normal_out
+            }
+            state_out = {
+                'throughput': L_throughput,
+                'normal_out': normal_out,
+                'normal_accum_length': normal_accum_length
+            }
+        else:
+            aovs_out = {
+                'throughput': δL_throughput if δL_throughput is not None else None,
+                'depth': δdepth if δdepth is not None else None,
+                'normal': δnormal if δnormal is not None else None
+            }
+            state_out = {'throughput': L_throughput}
+
+        return aovs_out, mi.Bool(True), state_out
 
     def traverse(self, cb):
         """Return differentiable parameters for optimization."""

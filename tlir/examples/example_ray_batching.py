@@ -136,15 +136,12 @@ config_advanced = cf.create_config(
     use_ray_batching=True,
     rays_per_batch=4096,
     enable_upsampling=False,                                     # Disable for SPN
-    gt_noise_std=0.02,                                          # GT noise augmentation
-    gt_noise_use_mask=True,                                     # Apply noise to background only
     stochastic_preconditioning_starting_alpha=0.01,             # SPN
     stochastic_preconditioning_iterations=total_iterations // 2
 )
 
 print("Advanced ray-based training:")
 print(f"  ✓ Ray batching: {config_advanced.rays_per_batch} rays/batch")
-print(f"  ✓ GT noise: std={config_advanced.gt_noise_std}, masked={config_advanced.gt_noise_use_mask}")
 print(f"  ✓ Stochastic preconditioning: alpha={config_advanced.stochastic_preconditioning_starting_alpha}")
 print(f"  ✓ Multi-resolution: disabled (using SPN)")
 print()

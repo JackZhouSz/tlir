@@ -85,15 +85,15 @@ class RadianceFieldPRB(TLIRIntegrator):
             p = ray(t)
 
             # Apply stochastic preconditioning: add Gaussian noise to query point
-            if spn_alpha > 0.0:
-                noise = mi.Vector3f(
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0,
-                    sampler.next_1d(active) * 2.0 - 1.0
-                )
-                # Scale noise by alpha and grid resolution (noise in world space)
-                noise_scale = spn_alpha / self.grid_res
-                p = p + noise * noise_scale
+            # Always generate noise to avoid JIT recompilation when spn_alpha changes
+            noise = mi.Vector3f(
+                sampler.next_1d(active) * 2.0 - 1.0,
+                sampler.next_1d(active) * 2.0 - 1.0,
+                sampler.next_1d(active) * 2.0 - 1.0
+            )
+            # Scale noise by alpha (will be 0 when SPN is disabled)
+            noise_scale = spn_alpha / self.grid_res
+            p = p + noise * noise_scale
 
             with dr.resume_grad(when=not primal):
                 sigmat = self.sigmat.eval(p)[0]

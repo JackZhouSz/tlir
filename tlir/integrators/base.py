@@ -35,6 +35,7 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
         self.spn_alpha = 0.0
         self.spn_gamma = 0.0
         self.spn_step = 0
+        self.spn_update_interval = 100  # Update alpha every N iterations
 
         # AOV loss configuration (opacity + empty space)
         self.target_masks = None
@@ -114,19 +115,25 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
             self.optimizer['sigmat'] = dr.maximum(self.optimizer['sigmat'], 0.0)
             self.params.update(self.optimizer)
 
-    def setup_stochastic_preconditioning(self, starting_alpha=0.0, num_iterations=-1):
+    def setup_stochastic_preconditioning(self, starting_alpha=0.0, num_iterations=-1,
+                                        update_interval=100):
         """Initialize stochastic preconditioning parameters.
 
         Args:
             starting_alpha: Starting noise scale
             num_iterations: Number of iterations for exponential decay
+            update_interval: Update alpha every N iterations (default: 100)
         """
         self.spn_alpha = starting_alpha
         self.spn_step = 0
+        self.spn_update_interval = update_interval
 
         # Calculate gamma for exponential decay
+        # Gamma is applied every update_interval iterations
+        # We want: final_alpha = starting_alpha * gamma^(num_iterations/update_interval) = starting_alpha * 1e-4
+        # So: gamma = (1e-4)^(update_interval/num_iterations)
         if num_iterations > 0 and starting_alpha > 0:
-            self.spn_gamma = (1e-16 / starting_alpha) ** (1.0 / num_iterations)
+            self.spn_gamma = 1e-4 ** (update_interval / num_iterations)
         else:
             self.spn_gamma = 0.0
             self.spn_alpha = 0.0
@@ -134,14 +141,21 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
     def update_spn_alpha(self, num_iterations=-1):
         """Update stochastic preconditioning alpha (exponential decay).
 
+        Alpha is only updated every `spn_update_interval` iterations to reduce overhead.
+
         Args:
             num_iterations: Total number of iterations for decay
         """
         if self.spn_step < num_iterations:
-            self.spn_alpha *= self.spn_gamma
+            # Only update alpha every update_interval iterations
+            if self.spn_step % self.spn_update_interval == 0:
+                self.spn_alpha *= self.spn_gamma
             self.spn_step += 1
         else:
+            # Explicitly set to 0 after decay period ends
             self.spn_alpha = 0.0
+            # Clamp step to prevent overflow
+            self.spn_step = max(self.spn_step, num_iterations)
 
     def get_spn_alpha(self):
         """Get current stochastic preconditioning alpha.
@@ -376,15 +390,15 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
         Returns:
             Perturbed or original query point
         """
-        if spn_alpha > 0.0:
-            noise = mi.Vector3f(
-                sampler.next_1d(active) * 2.0 - 1.0,
-                sampler.next_1d(active) * 2.0 - 1.0,
-                sampler.next_1d(active) * 2.0 - 1.0
-            )
-            noise_scale = spn_alpha / self.grid_res
-            return p + noise * noise_scale
-        return p
+        # Always generate noise to avoid JIT recompilation when spn_alpha changes
+        noise = mi.Vector3f(
+            sampler.next_1d(active) * 2.0 - 1.0,
+            sampler.next_1d(active) * 2.0 - 1.0,
+            sampler.next_1d(active) * 2.0 - 1.0
+        )
+        # Scale noise by alpha (will be 0 when SPN is disabled)
+        noise_scale = spn_alpha / self.grid_res
+        return p + noise * noise_scale
 
     def _eval_density(self, p, clip_bounds=True, use_majorant=False, majorant=None):
         """Evaluate density at query point with optional clipping and clamping.

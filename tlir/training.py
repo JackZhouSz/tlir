@@ -35,6 +35,7 @@ class TrainingConfig:
                  num_test_images: int = 1,
                  stochastic_preconditioning_starting_alpha: float = 0.0,
                  stochastic_preconditioning_iterations: int = -1,
+                 stochastic_preconditioning_update_interval: int = 100,
                  opacity_loss_weight: float = 0.0,
                  empty_space_loss_weight: float = 0.0):
         """
@@ -56,6 +57,7 @@ class TrainingConfig:
             num_test_images: Number of test images to render at end of each stage for PSNR evaluation
             stochastic_preconditioning_starting_alpha: Starting scale of noise for query points
             stochastic_preconditioning_iterations: Number of iterations for preconditioning decay
+            stochastic_preconditioning_update_interval: Update SPN alpha every N iterations (default: 100)
             opacity_loss_weight: Weight for opacity loss (throughput=1 where object_mask=1)
             empty_space_loss_weight: Weight for empty space loss (throughput=0 where object_mask=0)
         """
@@ -74,6 +76,7 @@ class TrainingConfig:
         self.num_test_images = num_test_images
         self.stochastic_preconditioning_starting_alpha = stochastic_preconditioning_starting_alpha
         self.stochastic_preconditioning_iterations = stochastic_preconditioning_iterations
+        self.stochastic_preconditioning_update_interval = stochastic_preconditioning_update_interval
         self.opacity_loss_weight = opacity_loss_weight
         self.empty_space_loss_weight = empty_space_loss_weight
 
@@ -346,7 +349,8 @@ def setup_training(
     integrator.initialize_optimizer(learning_rate=config.learning_rate)
     integrator.setup_stochastic_preconditioning(
         starting_alpha=config.stochastic_preconditioning_starting_alpha,
-        num_iterations=config.stochastic_preconditioning_iterations
+        num_iterations=config.stochastic_preconditioning_iterations,
+        update_interval=config.stochastic_preconditioning_update_interval
     )
 
 
@@ -367,7 +371,7 @@ def setup_stochastic_preconditioning(config: TrainingConfig) -> Dict[str, Any]:
 
     # Calculate gamma for exponential decay
     if config.stochastic_preconditioning_iterations > 0:
-        spn_state['gamma'] = (1e-16 / config.stochastic_preconditioning_starting_alpha) ** (
+        spn_state['gamma'] = 1e-4 ** (
             1.0 / config.stochastic_preconditioning_iterations
         )
     else:
@@ -520,7 +524,7 @@ def train_prb_volpath(scene: mi.Scene,
 
     # Calculate gamma for exponential decay
     if config.stochastic_preconditioning_iterations > 0:
-        spn_state['gamma'] = (1e-16 / config.stochastic_preconditioning_starting_alpha) ** (
+        spn_state['gamma'] = 1e-4 ** (
             1.0 / config.stochastic_preconditioning_iterations
         )
     else:
@@ -619,13 +623,19 @@ def create_sensors(num_sensors: int,
     return sensors
 
 
-def create_scene(integrator_type: str = 'rf_prb') -> mi.Scene:
+def create_scene(integrator_type: str = 'rf_prb', grid_res: int = 16,
+                sh_degree: int = 2, use_relu: bool = True,
+                max_initial_density: float = 5.0) -> mi.Scene:
     """
     Create a simple scene with the specified integrator.
-    
+
     Args:
         integrator_type: Type of integrator to use
-        
+        grid_res: Initial grid resolution
+        sh_degree: Spherical harmonics degree
+        use_relu: Whether to use ReLU activation
+        max_initial_density: Maximum initial density value
+
     Returns:
         Mitsuba scene
     """
@@ -640,12 +650,12 @@ def create_scene(integrator_type: str = 'rf_prb') -> mi.Scene:
                     'type': 'heterogeneous',
                     'sigma_t': {
                         'type': 'gridvolume',
-                        'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (16, 16, 16, 1))),
+                        'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (grid_res, grid_res, grid_res, 1))),
                         # 'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35).rotate([1, 0, 0], -90).scale(2).translate(-0.5)
                     },
                     # 'albedo': {
                     #     'type': 'gridvolume',
-                    #     'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (16, 16, 16, 3))),
+                    #     'grid': mi.VolumeGrid(dr.full(mi.TensorXf, 0.002, (grid_res, grid_res, grid_res, 3))),
                     #     # 'to_world': mi.ScalarTransform4f().translate(0.5).scale(0.35).rotate([1, 0, 0], -90).scale(2).translate(-0.5)
                     # },
                     # 'scale': 40
@@ -656,14 +666,45 @@ def create_scene(integrator_type: str = 'rf_prb') -> mi.Scene:
         }
         return mi.load_dict(scene_dict)
     elif integrator_type in ['rf_prb', 'rf_prb_rt', 'rf_prb_drt', 'rf_eikonal']:
+        from tlir.integrators.rf_prb import RadianceFieldPRB
+        from tlir.integrators.rf_prb_rt import RadianceFieldPRBRT
+        from tlir.integrators.rf_prb_drt import RadianceFieldPRBDRT
+
+        # Create integrator with specified parameters
+        if integrator_type == 'rf_prb':
+            integrator = RadianceFieldPRB(
+                grid_res=grid_res,
+                sh_degree=sh_degree,
+                use_relu=use_relu,
+                initial_density=max_initial_density / grid_res
+            )
+        elif integrator_type == 'rf_prb_rt':
+            integrator = RadianceFieldPRBRT(
+                grid_res=grid_res,
+                sh_degree=sh_degree,
+                use_relu=use_relu,
+                initial_density=max_initial_density / grid_res
+            )
+        elif integrator_type == 'rf_prb_drt':
+            integrator = RadianceFieldPRBDRT(
+                grid_res=grid_res,
+                sh_degree=sh_degree,
+                use_relu=use_relu,
+                initial_density=max_initial_density / grid_res
+            )
+        else:  # rf_eikonal
+            # Eikonal doesn't exist yet, fall back to rf_prb
+            integrator = RadianceFieldPRB(
+                grid_res=grid_res,
+                sh_degree=sh_degree,
+                use_relu=use_relu,
+                initial_density=max_initial_density / grid_res
+            )
+
         return mi.load_dict({
-            'type': 'scene', 
-            'integrator': {
-                'type': integrator_type
-            }, 
-            'emitter': {
-                'type': 'constant'
-            }
+            'type': 'scene',
+            'integrator': integrator,
+            'emitter': {'type': 'constant'}
         })
     else:
         raise ValueError(f"Unknown scene for integrator type: {integrator_type}")

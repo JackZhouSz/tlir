@@ -11,6 +11,8 @@ from tlir.config import ExperimentConfig
 import drjit as dr
 import mitsuba as mi
 from typing import List, Dict, Any, Optional, Callable
+from tlir.ray_batch import RayBatch, extract_rays_from_sensors
+
 import numpy as np
 
 
@@ -433,8 +435,6 @@ def train_radiance_field(scene: mi.Scene,
 
     if config.use_ray_batching:
         # Ray-based training: extract all rays upfront
-        from ray_batch import RayBatch, extract_rays_from_sensors
-
         print("=" * 70)
         print("Ray-based training mode")
         print("=" * 70)

@@ -38,8 +38,8 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
 
         # AOV loss configuration (opacity + empty space)
         self.target_masks = None
-        self.opacity_weight = 0.1
-        self.empty_space_weight = 0.1
+        self.opacity_weight = 1.0
+        self.empty_space_weight = 1.0
 
     # ========== Optimizer Management Methods ==========
 
@@ -214,26 +214,26 @@ class TLIRIntegrator(mi.python.ad.integrators.common.RBIntegrator):
         Override in subclasses for custom AOV losses.
 
         Args:
-            aovs: Dict with keys 'throughput', 'depth', 'normal'
+            aovs: Dict with keys 'opacity', 'depth', 'normal'
 
         Returns:
             Scalar loss value or None
         """
-        if self.target_masks is None or 'throughput' not in aovs:
+        if self.target_masks is None or 'opacity' not in aovs:
             return None
 
         total_loss = mi.Float(0.0)
-        throughput = aovs['throughput']
+        opacity = aovs['opacity']
 
-        # Opacity loss: throughput should be 1 where objects exist
+        # Opacity loss: opacity should be 1 where objects exist
         if self.opacity_weight > 0.0:
-            opacity_error = dr.square(throughput - 1.0) * self.target_masks
+            opacity_error = dr.square(opacity - 1.0) * self.target_masks
             opacity_loss = dr.mean(opacity_error, axis=None)
             total_loss += self.opacity_weight * opacity_loss
 
-        # Empty space loss: throughput should be 1 where background exists
+        # Empty space loss: opacity should be 0 where background exists
         if self.empty_space_weight > 0.0:
-            empty_space_error = dr.square(throughput) * (1.0 - self.target_masks)
+            empty_space_error = dr.square(opacity) * (1.0 - self.target_masks)
             empty_space_loss = dr.mean(empty_space_error, axis=None)
             total_loss += self.empty_space_weight * empty_space_loss
 

@@ -127,39 +127,39 @@ class RadianceFieldPRB(TLIRIntegrator):
 
         return L if primal else δL, mi.Bool(True), [], L
 
-    def compute_throughput_gradient_term(self, L_throughput, tr, Le):
+    def compute_opacity_gradient_term(self, opacity, tr, Le):
         """
-        Compute ∂(output_throughput)/∂(current_sample) for radiative backprop.
+        Compute ∂(output_opacity)/∂(current_sample) for radiative backprop.
 
-        For throughput with unit emission, this is:
-        ∂L_throughput/∂σ = L_throughput * tr / detach(tr) + Le
+        For opacity with unit emission, this is:
+        ∂opacity/∂σ = opacity * tr / detach(tr) + Le
 
         Args:
-            L_throughput: Accumulated throughput so far
+            opacity: Accumulated opacity so far
             tr: Transmittance at current sample (exp(-σ*Δt))
-            Le: Emission at current sample (default 1.0 for throughput)
+            Le: Emission at current sample (default 1.0 for opacity)
 
         Returns:
-            Gradient term to multiply by δL_throughput
+            Gradient term to multiply by δopacity
         """
-        return L_throughput * tr / dr.detach(tr) + Le
+        return opacity * tr / dr.detach(tr) + Le
 
-    def propagate_throughput_gradient(self, δL_throughput, L_throughput, tr, Le):
+    def propagate_opacity_gradient(self, δopacity, opacity, tr, Le):
         """
-        Propagate throughput gradient through backward pass.
+        Propagate opacity gradient through backward pass.
 
         Args:
-            δL_throughput: Gradient w.r.t. output throughput (or None)
-            L_throughput: Accumulated throughput so far
+            δopacity: Gradient w.r.t. output opacity (or None)
+            opacity: Accumulated opacity so far
             tr: Transmittance at current sample
             Le: Emission at current sample (default 1.0)
 
         Returns:
             None (accumulates gradients on parameters)
         """
-        if δL_throughput is not None:
-            throughput_grad_term = self.compute_throughput_gradient_term(L_throughput, tr, Le)
-            dr.backward_from(δL_throughput * throughput_grad_term)
+        if δopacity is not None:
+            opacity_grad_term = self.compute_opacity_gradient_term(opacity, tr, Le)
+            dr.backward_from(δopacity * opacity_grad_term)
 
     def compute_radiance_gradient_term(self, L, tr, Le):
         """
@@ -210,16 +210,13 @@ class RadianceFieldPRB(TLIRIntegrator):
         # Extract stochastic preconditioning alpha
         spn_alpha = kwargs.get('spn_alpha', 0.0)
 
-        # Extract point-dependent loss functions
-        point_loss_fns = kwargs.get('point_loss_fns', None)
-
         # Extract gradients from dict (if in backward mode)
-        δL_throughput = None
+        δopacity = None
         δdepth = None
         δnormal = None
         if δaovs is not None and isinstance(δaovs, dict):
-            if δaovs.get('throughput') is not None:
-                δL_throughput = mi.Float(δaovs['throughput'])
+            if δaovs.get('opacity') is not None:
+                δopacity = mi.Float(δaovs['opacity'])
             if δaovs.get('depth') is not None:
                 δdepth = mi.Float(δaovs['depth'])
             if δaovs.get('normal') is not None:
@@ -229,8 +226,8 @@ class RadianceFieldPRB(TLIRIntegrator):
         has_grad = True
         if not primal:
             has_grad = mi.Bool(False)
-            if δL_throughput is not None:
-                has_grad |= dr.any(δL_throughput != 0)
+            if δopacity is not None:
+                has_grad |= dr.any(δopacity != 0)
             if δdepth is not None:
                 has_grad |= dr.any(δdepth != 0)
             if δnormal is not None:
@@ -242,12 +239,12 @@ class RadianceFieldPRB(TLIRIntegrator):
         step_size = mi.Float(1.0 / self.grid_res)
         t = mi.Float(mint) + sampler.next_1d(active) * step_size
 
-        # Initialize throughput and state
+        # Initialize opacity and state
         if primal:
-            L_throughput = mi.Float(0.0)
+            opacity = mi.Float(0.0)
         else:
             # Unpack state from forward pass
-            L_throughput = state_in.get('throughput', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
+            opacity = state_in.get('opacity', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
 
         β = mi.Float(1.0)  # throughput along ray
 
@@ -279,13 +276,13 @@ class RadianceFieldPRB(TLIRIntegrator):
                 normal_accum = normal_accum - normal_contrib
 
             β *= tr
-            L_throughput = L_throughput + Le_aov if primal else L_throughput - dr.detach(Le_aov)
+            opacity = opacity + Le_aov if primal else opacity - dr.detach(Le_aov)
 
             # BACKWARD PASS: Propagate gradients using helper functions
             with dr.resume_grad(when=not primal):
                 if not primal:
                     # Propagate gradients using convenience helpers
-                    self.propagate_throughput_gradient(δL_throughput, L_throughput, tr, Le_aov)
+                    self.propagate_opacity_gradient(δopacity, opacity, tr, Le_aov)
                     self.propagate_depth_gradient(δdepth, depth_contrib)
                     self.propagate_normal_gradient(δnormal, normal_contrib, state_in)
 
@@ -300,23 +297,23 @@ class RadianceFieldPRB(TLIRIntegrator):
         # Return dict of AOVs (in primal) or gradients (in backward)
         if primal:
             aovs_out = {
-                'throughput': L_throughput,
+                'opacity': opacity,
                 'depth': depth,
                 'normal': normal_out
             }
             # State for backward pass
             state_out = {
-                'throughput': L_throughput,
+                'opacity': opacity,
                 'normal_out': normal_out,
                 'normal_accum_length': normal_accum_length
             }
         else:
             aovs_out = {
-                'throughput': δL_throughput if δL_throughput is not None else None,
+                'opacity': δopacity if δopacity is not None else None,
                 'depth': δdepth if δdepth is not None else None,
                 'normal': δnormal if δnormal is not None else None
             }
-            state_out = {'throughput': L_throughput}
+            state_out = {'opacity': opacity}
 
         return aovs_out, mi.Bool(True), state_out
 

@@ -222,47 +222,31 @@ def extract_rays_from_sensors(
         film = sensor.film()
         res = film.size()
         width, height = res[0], res[1]
-        
-        # Create pixel coordinates
-        # Mitsuba uses (x, y) where x is horizontal, y is vertical
-        # Create meshgrid of pixel coordinates
-        x_coords = np.arange(width, dtype=np.float32)
-        y_coords = np.arange(height, dtype=np.float32)
-        xx, yy = np.meshgrid(x_coords, y_coords, indexing='xy')
-        
-        # Flatten to get array of pixel positions
-        pixel_x = xx.flatten()  # Shape: (width * height,)
-        pixel_y = yy.flatten()
-        
-        # Add 0.5 to sample at pixel centers
-        pixel_x = pixel_x + 0.5
-        pixel_y = pixel_y + 0.5
-        
-        # Normalize to [0, 1]
-        pixel_x_norm = pixel_x / width
-        pixel_y_norm = pixel_y / height
-        
-        # Create sample positions for Mitsuba
-        # Mitsuba expects positions in [0, 1] range
         num_pixels = width * height
-        positions = np.stack([pixel_x_norm, pixel_y_norm], axis=1)  # Shape: (N, 2)
-        
-        # Sample rays from sensor
-        # We need to generate rays for each pixel
-        ray_origins = []
-        ray_directions = []
-        
-        for i in range(num_pixels):
-            pos = mi.Point2f(positions[i, 0], positions[i, 1])
-            
-            # Sample ray from sensor at this pixel position
-            ray, _ = sensor.sample_ray(0.0, 0.0, pos, mi.Point2f(0.5, 0.5))
-            
-            ray_origins.append([ray.o.x, ray.o.y, ray.o.z])
-            ray_directions.append([ray.d.x, ray.d.y, ray.d.z])
-        
-        ray_origins = np.array(ray_origins, dtype=np.float32)
-        ray_directions = np.array(ray_directions, dtype=np.float32)
+
+        # Generate pixel positions using DrJit (same as render_camera)
+        idx = dr.arange(mi.UInt32, num_pixels)
+        x = idx % width
+        y = idx // width
+
+        # Convert to normalized coordinates [0, 1]
+        pos_x = (x + 0.5) / width
+        pos_y = (y + 0.5) / height
+        pos_sample = mi.Point2f(pos_x, pos_y)
+
+        # Sample rays from sensor (vectorized)
+        wavelength_sample = 0.5
+        time_sample = 0.0
+        aperture_sample = mi.Point2f(0.5, 0.5)
+        rays, _ = sensor.sample_ray(time_sample, wavelength_sample, pos_sample, aperture_sample)
+
+        # Extract origins and directions to NumPy arrays
+        ray_origins = np.stack([np.array(rays.o.x), np.array(rays.o.y), np.array(rays.o.z)], axis=1).astype(np.float32)
+        ray_directions = np.stack([np.array(rays.d.x), np.array(rays.d.y), np.array(rays.d.z)], axis=1).astype(np.float32)
+
+        # Store pixel coordinates for metadata
+        pixel_x = np.array(x, dtype=np.float32)
+        pixel_y = np.array(y, dtype=np.float32)
         
         # Extract colors from reference image
         # Convert Mitsuba tensor to numpy

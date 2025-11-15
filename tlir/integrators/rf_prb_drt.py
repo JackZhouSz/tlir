@@ -209,65 +209,11 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
 
         return L if primal else δL, mi.Bool(True), [], L
 
-    def compute_throughput_gradient_term_drt(self, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
-        """
-        Compute ∂(output_throughput)/∂(current_sample) for delta ratio tracking (main loop).
-
-        Similar to RT but with DRT-specific formulation.
-        """
-        return (sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
-                + Le)
-
-    def compute_throughput_gradient_term_drt_reservoir(self, sigmat, w_acc, Le=1.0):
-        """
-        Compute ∂(output_throughput)/∂(reservoir_sample) for delta ratio tracking.
-
-        This is the additional DRT-specific gradient from the reservoir sample.
-        """
-        return sigmat * dr.detach(w_acc * Le / (sigmat * sigmat + 1.0))
-
-    def propagate_throughput_gradient_drt(self, δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0):
-        """
-        Propagate throughput gradient through backward pass (delta ratio tracking, main loop).
-
-        Args:
-            δL_throughput: Gradient w.r.t. output throughput (or None)
-            sigmat: Extinction coefficient at current sample
-            trans_grad_buffer: Accumulated transmittance gradient
-            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
-            Le: Emission at current sample (default 1.0)
-
-        Returns:
-            None (accumulates gradients on parameters)
-        """
-        if δL_throughput is not None:
-            throughput_grad_term = self.compute_throughput_gradient_term_drt(
-                sigmat, trans_grad_buffer, interaction_mask, Le
-            )
-            dr.backward_from(δL_throughput * throughput_grad_term)
-
-    def propagate_throughput_gradient_drt_reservoir(self, δL_throughput, sigmat, w_acc, Le=1.0):
-        """
-        Propagate throughput gradient from reservoir sample (delta ratio tracking).
-
-        Args:
-            δL_throughput: Gradient w.r.t. output throughput (or None)
-            sigmat: Extinction coefficient at reservoir sample
-            w_acc: Accumulated weight for reservoir sampling
-            Le: Emission at current sample (default 1.0)
-
-        Returns:
-            None (accumulates gradients on parameters)
-        """
-        if δL_throughput is not None:
-            throughput_grad_term = self.compute_throughput_gradient_term_drt_reservoir(sigmat, w_acc, Le)
-            dr.backward_from(δL_throughput * throughput_grad_term)
-
     def compute_radiance_gradient_term_drt(self, sigmat, trans_grad_buffer, interaction_mask, Le):
         """
         Compute ∂(output_radiance)/∂(current_sample) for delta ratio tracking (main loop).
 
-        Same formula as throughput, but with arbitrary emission Le.
+        General formula that works for both opacity (Le=1.0) and radiance (arbitrary Le).
 
         Args:
             sigmat: Extinction coefficient at current sample
@@ -278,7 +224,61 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         Returns:
             Gradient term to multiply by δL
         """
-        return self.compute_throughput_gradient_term_drt(sigmat, trans_grad_buffer, interaction_mask, Le)
+        return (sigmat * dr.detach(Le * sigmat / (sigmat * sigmat + 1.0))
+                + Le)
+
+    def compute_radiance_gradient_term_drt_reservoir(self, sigmat, w_acc, Le):
+        """
+        Compute ∂(output_radiance)/∂(reservoir_sample) for delta ratio tracking.
+
+        General formula that works for both opacity and radiance.
+
+        Args:
+            sigmat: Extinction coefficient at reservoir sample
+            w_acc: Accumulated weight for reservoir sampling
+            Le: Emission at current sample
+
+        Returns:
+            Gradient term to multiply by δL
+        """
+        return sigmat * dr.detach(w_acc * Le / (sigmat * sigmat + 1.0))
+
+    def propagate_opacity_gradient_drt(self, δopacity, sigmat, trans_grad_buffer, interaction_mask, Le):
+        """
+        Propagate opacity gradient through backward pass (delta ratio tracking, main loop).
+
+        Args:
+            δopacity: Gradient w.r.t. output opacity (or None)
+            sigmat: Extinction coefficient at current sample
+            trans_grad_buffer: Accumulated transmittance gradient
+            interaction_mask: 1.0 if interaction occurred, 0.0 otherwise
+            Le: Emission at current sample (typically 1.0 for opacity)
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δopacity is not None:
+            opacity_grad_term = self.compute_radiance_gradient_term_drt(
+                sigmat, trans_grad_buffer, interaction_mask, Le
+            )
+            dr.backward_from(δopacity * opacity_grad_term)
+
+    def propagate_opacity_gradient_drt_reservoir(self, δopacity, sigmat, w_acc, Le):
+        """
+        Propagate opacity gradient from reservoir sample (delta ratio tracking).
+
+        Args:
+            δopacity: Gradient w.r.t. output opacity (or None)
+            sigmat: Extinction coefficient at reservoir sample
+            w_acc: Accumulated weight for reservoir sampling
+            Le: Emission at current sample (typically 1.0 for opacity)
+
+        Returns:
+            None (accumulates gradients on parameters)
+        """
+        if δopacity is not None:
+            opacity_grad_term = self.compute_radiance_gradient_term_drt_reservoir(sigmat, w_acc, Le)
+            dr.backward_from(δopacity * opacity_grad_term)
 
     def propagate_radiance_gradient_drt(self, δL, sigmat, trans_grad_buffer, interaction_mask, Le):
         """
@@ -306,22 +306,6 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
                     sigmat, trans_grad_buffer, interaction_mask, Le
                 )
                 dr.backward_from(δL * radiance_grad_term)
-
-    def compute_radiance_gradient_term_drt_reservoir(self, sigmat, w_acc, Le):
-        """
-        Compute ∂(output_radiance)/∂(reservoir_sample) for delta ratio tracking.
-
-        This is the additional DRT-specific gradient from the reservoir sample.
-
-        Args:
-            sigmat: Extinction coefficient at reservoir sample
-            w_acc: Accumulated weight for reservoir sampling
-            Le: Emission at current sample
-
-        Returns:
-            Gradient term to multiply by δL
-        """
-        return self.compute_throughput_gradient_term_drt_reservoir(sigmat, w_acc, Le)
 
     def propagate_radiance_gradient_drt_reservoir(self, δL, sigmat, w_acc, Le):
         """
@@ -364,12 +348,12 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         spn_alpha = kwargs.get('spn_alpha', 0.0)
 
         # Extract gradients from dict
-        δL_throughput = None
+        δopacity = None
         δdepth = None
         δnormal = None
         if δaovs is not None and isinstance(δaovs, dict):
-            if δaovs.get('throughput') is not None:
-                δL_throughput = mi.Float(δaovs['throughput'])
+            if δaovs.get('opacity') is not None:
+                δopacity = mi.Float(δaovs['opacity'])
             if δaovs.get('depth') is not None:
                 δdepth = mi.Float(δaovs['depth'])
             if δaovs.get('normal') is not None:
@@ -379,8 +363,8 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         has_grad = True
         if not primal:
             has_grad = mi.Bool(False)
-            if δL_throughput is not None:
-                has_grad |= dr.any(δL_throughput != 0)
+            if δopacity is not None:
+                has_grad |= dr.any(δopacity != 0)
             if δdepth is not None:
                 has_grad |= dr.any(δdepth != 0)
             if δnormal is not None:
@@ -391,9 +375,9 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
 
         # Initialize state
         if primal:
-            L_throughput = mi.Float(0.0)
+            opacity = mi.Float(0.0)
         else:
-            L_throughput = state_in.get('throughput', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
+            opacity = state_in.get('opacity', mi.Float(0.0)) if isinstance(state_in, dict) else mi.Float(0.0)
 
         # AOV accumulators
         depth = mi.Float(0.0)
@@ -469,13 +453,13 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
                 depth = depth - depth_contrib
                 normal_accum = normal_accum - normal_contrib
 
-            L_throughput = Le_aov if primal else L_throughput - Le_aov
+            opacity = Le_aov if primal else opacity - Le_aov
 
             # BACKWARD PASS (main loop)
             with dr.resume_grad(when=not primal):
                 if not primal and not self.stopgrad_density:
                     # Propagate gradients using convenience helpers
-                    self.propagate_throughput_gradient_drt(δL_throughput, sigmat, trans_grad_buffer, interaction_mask, Le=1.0)
+                    self.propagate_opacity_gradient_drt(δopacity, sigmat, trans_grad_buffer, interaction_mask, Le_aov)
                     self.propagate_depth_gradient(δdepth, depth_contrib)
                     self.propagate_normal_gradient(δnormal, normal_contrib, state_in)
 
@@ -500,11 +484,11 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
                 majorant = self.majorant_grid.eval(dr.clip(p_query, 0.0, 1.0))[0]
                 sigmat = self._eval_density(p_query, use_majorant=True, majorant=majorant)
 
-                # Propagate throughput gradient from reservoir sample
-                self.propagate_throughput_gradient_drt_reservoir(δL_throughput, sigmat, w_acc, Le=1.0)
+                # Propagate opacity gradient from reservoir sample
+                self.propagate_opacity_gradient_drt_reservoir(δopacity, sigmat, w_acc, 1.0)
 
                 # Note: Depth and normal gradients are already handled in the main loop
-                # The reservoir sample is primarily for the throughput/radiance gradient
+                # The reservoir sample is primarily for the opacity/radiance gradient
 
         # Normalize normal
         normal_out, normal_accum_length = self._normalize_normal_output(normal_accum)
@@ -512,22 +496,22 @@ class RadianceFieldPRBDRT(TLIRIntegrator):
         # Return dicts
         if primal:
             aovs_out = {
-                'throughput': L_throughput,
+                'opacity': opacity,
                 'depth': depth,
                 'normal': normal_out
             }
             state_out = {
-                'throughput': L_throughput,
+                'opacity': opacity,
                 'normal_out': normal_out,
                 'normal_accum_length': normal_accum_length
             }
         else:
             aovs_out = {
-                'throughput': δL_throughput if δL_throughput is not None else None,
+                'opacity': δopacity if δopacity is not None else None,
                 'depth': δdepth if δdepth is not None else None,
                 'normal': δnormal if δnormal is not None else None
             }
-            state_out = {'throughput': L_throughput}
+            state_out = {'opacity': opacity}
 
         return aovs_out, mi.Bool(True), state_out
 
